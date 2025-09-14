@@ -3,7 +3,7 @@
 
 import time, signal, os
 from pidog import Pidog
-# from preset_actions import bark  # keep if you have it
+from preset_actions import bark
 
 DANGER_DISTANCE = 15
 
@@ -29,7 +29,7 @@ def main():
                 dog.legs_move([stand], speed=70)
                 dog.wait_all_done()
                 time.sleep(0.5)
-                # bark(dog, [head_yaw, 0, 0])  # keep if available
+                bark(dog, [head_yaw, 0, 0])  # keep if available
                 while True:
                     d = round(dog.read_distance(), 2)
                     if d >= DANGER_DISTANCE or d <= 0:
