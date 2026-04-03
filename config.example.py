@@ -47,3 +47,12 @@ SEARCH_TIMEOUT_S   = 5.0
 EXPLORE_TIMEOUT_S  = 30.0
 
 HEAD_DEFAULT_PITCH = -30
+
+# =============================================================================
+# Remote Control (Teleoperation)
+# =============================================================================
+
+REMOTE_CMD_PORT   = 5557        # Mac→Pi: WASD commands
+REMOTE_TELEM_PORT = 5558        # Pi→Mac: telemetry (distance, battery, state)
+DANGER_DISTANCE   = 15          # cm — ultrasonic auto-stop threshold
+
