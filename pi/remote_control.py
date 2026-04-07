@@ -9,21 +9,39 @@ import sys
 import signal
 import time
 import json
+import atexit
+import subprocess
 
 import zmq
-
-# ── PiDog SDK ────────────────────────────────────────────────────────────────
-from pidog import Pidog
 
 # ── Config (shared with Mac) ─────────────────────────────────────────────────
 # When deployed to Pi, config.py lives in the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
-try:
-    from preset_actions import bark as bark_action
-except ImportError:
-    bark_action = None
+# ── GPIO cleanup (same function as motor_controller.py) ─────────────────────
+def _cleanup_orphaned_pidog():
+    """Kill orphaned PiDog sensor subprocesses from a previous crash."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "pidog.*sensory|sensory.*pidog"],
+            capture_output=True, text=True, timeout=3
+        )
+        my_pid = str(os.getpid())
+        for pid in result.stdout.strip().split("\n"):
+            pid = pid.strip()
+            if pid and pid != my_pid:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+    except Exception:
+        pass
+    time.sleep(0.3)
+
+_cleanup_orphaned_pidog()
+
+from pidog import Pidog
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DANGER_DISTANCE = getattr(config, "DANGER_DISTANCE", 15)
@@ -46,6 +64,8 @@ class RemoteController:
         print("=" * 60)
         print("  IronBark — Remote Control (Pi Side)")
         print("=" * 60)
+
+        self._shutdown_done = False
 
         # ── Init PiDog ───────────────────────────────────────────────
         print("[RC] Initializing PiDog...")
@@ -75,6 +95,10 @@ class RemoteController:
         self.telem_sock.bind(f"tcp://*:{TELEM_PORT}")
         print(f"[RC] TELEM PUB bound on tcp://*:{TELEM_PORT}")
 
+        # Register cleanup for SIGTERM (plain `kill`) and atexit
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        atexit.register(self._shutdown)
+
         # ── State ────────────────────────────────────────────────────
         self.current_action = "stop"
         self.danger = False
@@ -103,13 +127,17 @@ class RemoteController:
                         self.dog.legs_move([self.stand_angles], speed=70)
                         self.dog.wait_all_done()
                         self.danger = True
-                        # Bark warning
-                        if bark_action:
-                            try:
-                                head_yaw = self.dog.head_current_angles[0]
-                                bark_action(self.dog, [head_yaw, 0, 0])
-                            except Exception:
-                                pass
+                        # Bark warning — head only
+                        try:
+                            cur_yaw = self.dog.head_current_angles[0]
+                            bark_pitch = getattr(config, "BARK_HEAD_PITCH", 35)
+                            self.dog.head_move([[cur_yaw, 0, bark_pitch]], speed=80)
+                            self.dog.wait_head_done()
+                            self.dog.speak("single_bark_1", 80)
+                            time.sleep(0.4)
+                            self.dog.head_move([[cur_yaw, 0, getattr(config, "HEAD_DEFAULT_PITCH", 15)]], speed=60)
+                        except Exception:
+                            pass
                     action = "stop"  # override forward with stop
                 else:
                     if self.danger:
@@ -172,13 +200,18 @@ class RemoteController:
 
         elif action == "bark":
             self.dog.body_stop()
-            if bark_action:
-                try:
-                    head_yaw = self.dog.head_current_angles[0]
-                    bark_action(self.dog, [head_yaw, 0, 0])
-                except Exception:
-                    pass
+            try:
+                cur_yaw = self.dog.head_current_angles[0]
+                bark_pitch = getattr(config, "BARK_HEAD_PITCH", 35)
+                self.dog.head_move([[cur_yaw, 0, bark_pitch]], speed=80)
+                self.dog.wait_head_done()
+                self.dog.speak("single_bark_1", 80)
+                time.sleep(0.5)
+                self.dog.head_move([[cur_yaw, 0, getattr(config, "HEAD_DEFAULT_PITCH", 15)]], speed=60)
+            except Exception:
+                pass
             self.current_action = "stop"
+            print("[RC] → BARK")
 
         elif action == "stand":
             self.dog.body_stop()
@@ -220,8 +253,17 @@ class RemoteController:
         except Exception:
             pass
 
+    def _signal_handler(self, signum, frame):
+        print(f"\n[RC] Received signal {signum} — shutting down...")
+        self.running = False
+        self._shutdown()
+        sys.exit(0)
+
     def _shutdown(self):
         """Clean shutdown: stop dog, kill sensor process, close ZMQ."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         print("[RC] Shutting down PiDog...")
         try:
             self.dog.body_stop()
@@ -244,6 +286,8 @@ class RemoteController:
         try:
             self.dog.close()
         except SystemExit:
+            pass
+        except Exception:
             pass
 
         self.cmd_sock.close()

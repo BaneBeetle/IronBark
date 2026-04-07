@@ -53,15 +53,33 @@ class FaceRecognizer:
             return None
         return faces[0].embedding
 
-    def enroll_owner(self, face_crop):
-        embedding = self._extract_embedding(face_crop)
-        if embedding is None:
-            raise ValueError("No face detected in the enrollment crop!")
+    def enroll_owner(self, embeddings):
+        """
+        Enroll the owner from N pre-computed insightface embeddings.
+        L2-normalizes each, averages them, then re-normalizes the result.
+        Multi-shot averaging is dramatically more robust than a single capture.
+        """
+        if not embeddings:
+            raise ValueError("No embeddings provided for enrollment")
+
+        normed = []
+        for e in embeddings:
+            n = np.linalg.norm(e)
+            if n > 0:
+                normed.append(e / n)
+
+        if not normed:
+            raise ValueError("All embeddings have zero norm")
+
+        mean = np.mean(normed, axis=0)
+        n = np.linalg.norm(mean)
+        final = (mean / n) if n > 0 else mean
+
         self.embedding_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(str(self.embedding_path), embedding)
-        self.owner_embedding = embedding
-        print(f"[FaceRecognizer] Owner enrolled! Saved to {self.embedding_path}")
-        return embedding
+        np.save(str(self.embedding_path), final)
+        self.owner_embedding = final
+        print(f"[FaceRecognizer] Owner enrolled from {len(normed)} samples → {self.embedding_path}")
+        return final
 
     def recognize(self, face_crop):
         if self.owner_embedding is None:

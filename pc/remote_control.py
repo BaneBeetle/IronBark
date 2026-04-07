@@ -82,6 +82,22 @@ class TelemetryReceiver:
         self.sock.close()
 
 
+def safe_addstr(stdscr, row, col, text, attr=0):
+    """Write text to curses screen, silently skip if out of bounds."""
+    h, w = stdscr.getmaxyx()
+    if row < 0 or row >= h or col < 0 or col >= w:
+        return
+    # Truncate text to fit within the window width
+    max_len = w - col - 1
+    if max_len <= 0:
+        return
+    text = str(text)[:max_len]
+    try:
+        stdscr.addstr(row, col, text, attr)
+    except curses.error:
+        pass
+
+
 def main(stdscr):
     # ── Curses setup ─────────────────────────────────────────────────────
     curses.curs_set(0)
@@ -110,6 +126,7 @@ def main(stdscr):
     current_action = "stop"
     last_key_time = time.time()
     send_count = 0
+    put = safe_addstr  # shorthand
 
     try:
         while True:
@@ -142,88 +159,65 @@ def main(stdscr):
             h, w = stdscr.getmaxyx()
 
             # Title
-            title = "══════ IronBark Remote Control ══════"
-            stdscr.addstr(0, max(0, (w - len(title)) // 2), title, curses.color_pair(4) | curses.A_BOLD)
+            title = "====== IronBark Remote Control ======"
+            put(stdscr, 0, max(0, (w - len(title)) // 2), title, curses.color_pair(4) | curses.A_BOLD)
 
             # Controls help
-            stdscr.addstr(2, 2, "Controls:", curses.color_pair(4) | curses.A_BOLD)
-            stdscr.addstr(3, 4, "W", curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(3, 5, " = Forward", curses.color_pair(5))
-            stdscr.addstr(3, 18, "A", curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(3, 19, " = Turn Left", curses.color_pair(5))
-            stdscr.addstr(4, 4, "S", curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(4, 5, " = Backward", curses.color_pair(5))
-            stdscr.addstr(4, 18, "D", curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(4, 19, " = Turn Right", curses.color_pair(5))
-            stdscr.addstr(5, 4, "Space", curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(5, 9, " = Bark", curses.color_pair(5))
-            stdscr.addstr(5, 18, "1/2/3", curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(5, 23, " = Stand/Sit/Lie", curses.color_pair(5))
-            stdscr.addstr(6, 4, "Q/ESC", curses.color_pair(2) | curses.A_BOLD)
-            stdscr.addstr(6, 9, " = Quit", curses.color_pair(5))
+            put(stdscr, 2, 2, "W=Fwd  A=Left  S=Back  D=Right", curses.color_pair(1))
+            put(stdscr, 3, 2, "Space=Bark  1/2/3=Stand/Sit/Lie  Q=Quit", curses.color_pair(5))
 
-            # Separator
-            stdscr.addstr(8, 2, "─" * min(50, w - 4), curses.color_pair(5))
-
-            # Current action (big display)
+            # Current action
             action_display = current_action.upper().replace("_", " ")
             if current_action == "stop":
                 action_color = curses.color_pair(5)
             elif t.get("danger", False):
                 action_color = curses.color_pair(2) | curses.A_BOLD
-                action_display = "⚠ DANGER STOP ⚠"
+                action_display = "!! DANGER STOP !!"
             else:
                 action_color = curses.color_pair(1) | curses.A_BOLD
 
-            stdscr.addstr(10, 2, "Action: ", curses.color_pair(3))
-            stdscr.addstr(10, 10, f"  {action_display}  ", action_color)
+            put(stdscr, 5, 2, "Action: ", curses.color_pair(3))
+            put(stdscr, 5, 10, f" {action_display} ", action_color)
 
-            # WASD visual
-            wa = "▲" if current_action == "forward" else "△"
-            sa = "▼" if current_action == "backward" else "▽"
-            aa = "◀" if current_action == "turn_left" else "◁"
-            da = "▶" if current_action == "turn_right" else "▷"
+            # WASD visual (ASCII arrows)
+            wa = "W" if current_action == "forward" else "."
+            sa = "S" if current_action == "backward" else "."
+            aa = "A" if current_action == "turn_left" else "."
+            da = "D" if current_action == "turn_right" else "."
 
-            col = max(0, w // 2 - 2)
-            stdscr.addstr(12, col, wa, curses.color_pair(1) if current_action == "forward" else curses.color_pair(5))
-            stdscr.addstr(13, col - 2, aa, curses.color_pair(1) if current_action == "turn_left" else curses.color_pair(5))
-            stdscr.addstr(13, col, sa, curses.color_pair(1) if current_action == "backward" else curses.color_pair(5))
-            stdscr.addstr(13, col + 2, da, curses.color_pair(1) if current_action == "turn_right" else curses.color_pair(5))
+            col = min(20, max(6, w // 2 - 2))
+            put(stdscr, 7, col + 1, wa, curses.color_pair(1) | curses.A_BOLD if current_action == "forward" else curses.color_pair(5))
+            put(stdscr, 8, col - 1, aa, curses.color_pair(1) | curses.A_BOLD if current_action == "turn_left" else curses.color_pair(5))
+            put(stdscr, 8, col + 1, sa, curses.color_pair(1) | curses.A_BOLD if current_action == "backward" else curses.color_pair(5))
+            put(stdscr, 8, col + 3, da, curses.color_pair(1) | curses.A_BOLD if current_action == "turn_right" else curses.color_pair(5))
 
-            # Telemetry
-            stdscr.addstr(15, 2, "─" * min(50, w - 4), curses.color_pair(5))
-            stdscr.addstr(16, 2, "Telemetry:", curses.color_pair(4) | curses.A_BOLD)
+            # Telemetry section
+            row = 10
+            put(stdscr, row, 2, "--- Telemetry ---", curses.color_pair(4))
 
             dist = t.get("distance_cm", -1)
             if dist < 0:
                 dist_str = "N/A"
                 dist_color = curses.color_pair(5)
             elif dist < 15:
-                dist_str = f"{dist:.1f} cm  ⚠ DANGER"
+                dist_str = f"{dist:.1f}cm DANGER"
                 dist_color = curses.color_pair(2) | curses.A_BOLD
             elif dist < 50:
-                dist_str = f"{dist:.1f} cm"
+                dist_str = f"{dist:.1f}cm"
                 dist_color = curses.color_pair(4)
             else:
-                dist_str = f"{dist:.1f} cm"
+                dist_str = f"{dist:.1f}cm"
                 dist_color = curses.color_pair(1)
 
-            battery = t.get("battery_v", 0)
-            if battery < 6.5 and battery > 0:
-                bat_color = curses.color_pair(2)
-            else:
-                bat_color = curses.color_pair(1)
+            battery = t.get("battery_v", 0.0)
+            bat_color = curses.color_pair(2) if (0 < battery < 6.5) else curses.color_pair(1)
 
-            pi_action = t.get("action", "?")
+            pi_action = str(t.get("action", "?"))
 
-            stdscr.addstr(17, 4, f"Distance:  ", curses.color_pair(3))
-            stdscr.addstr(17, 15, dist_str, dist_color)
-            stdscr.addstr(18, 4, f"Battery:   ", curses.color_pair(3))
-            stdscr.addstr(18, 15, f"{battery:.2f}V", bat_color)
-            stdscr.addstr(19, 4, f"Pi state:  ", curses.color_pair(3))
-            stdscr.addstr(19, 15, pi_action.upper(), curses.color_pair(5))
-            stdscr.addstr(20, 4, f"Cmds sent: ", curses.color_pair(3))
-            stdscr.addstr(20, 15, str(send_count), curses.color_pair(5))
+            put(stdscr, row + 1, 2, f"Dist: {dist_str}", dist_color)
+            put(stdscr, row + 2, 2, f"Batt: {battery:.2f}V", bat_color)
+            put(stdscr, row + 3, 2, f"Pi:   {pi_action.upper()}", curses.color_pair(5))
+            put(stdscr, row + 4, 2, f"Sent: {send_count}", curses.color_pair(5))
 
             # Connection status
             age = time.time() - t.get("timestamp", 0)
@@ -237,8 +231,7 @@ def main(stdscr):
                 conn_str = f"STALE ({age:.0f}s)"
                 conn_color = curses.color_pair(4)
 
-            stdscr.addstr(21, 4, f"Link:      ", curses.color_pair(3))
-            stdscr.addstr(21, 15, conn_str, conn_color)
+            put(stdscr, row + 5, 2, f"Link: {conn_str}", conn_color)
 
             stdscr.refresh()
 
@@ -253,8 +246,8 @@ def main(stdscr):
 
 if __name__ == "__main__":
     print(f"Connecting to PiDog at {PI_IP}...")
-    print(f"  CMD  → tcp://{PI_IP}:{CMD_PORT}")
-    print(f"  TELEM ← tcp://{PI_IP}:{TELEM_PORT}")
+    print(f"  CMD  -> tcp://{PI_IP}:{CMD_PORT}")
+    print(f"  TELEM <- tcp://{PI_IP}:{TELEM_PORT}")
     print("Starting TUI... (press Q to quit)")
     time.sleep(0.5)
     curses.wrapper(main)
