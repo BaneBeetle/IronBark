@@ -45,7 +45,12 @@ TARGET_FPS        = 30
 YOLO_MODEL          = "yolo11n.pt"
 YOLO_CONF_THRESHOLD = 0.5
 
-VLM_MODEL = "llava:7b"
+# VLM model — moondream is ~5-9x faster than llava:7b and dramatically
+# better at grounding (doesn't hallucinate people/wheelchairs/hospitals
+# from furniture). Benchmarked at ~245ms per query vs llava:7b's ~1200ms,
+# which lets 2-consecutive-same mode hysteresis commit in ~500ms instead
+# of 12-15 seconds. See scratch_benchmark_models.py for numbers.
+VLM_MODEL = "moondream"
 VLM_HOST  = "http://localhost:11434"
 
 FACE_THRESHOLD       = 0.45     # cosine sim cutoff (was 0.35; bumped after multi-shot enrollment)
@@ -137,3 +142,25 @@ VLM_EXPLORE_STEP_COUNT    = 3       # steps per VLM-directed movement
 VLM_EXPLORE_SPEED         = 70      # cautious explore speed
 VLM_EXPLORE_BACK_STEPS    = 8       # step_count for 180° turn (BACK direction)
 VLM_EXPLORE_DIRECTION_TIMEOUT_S = 5.0  # expire stale explore direction
+
+# Head pitch during SEARCH/EXPLORE (negative = looking down toward the floor).
+# During FOLLOW the head is pitched up to track the owner's face, which is
+# terrible for navigating — searching for doorways by looking at the ceiling
+# is useless. When no owner is visible, pitch the head forward-and-down so
+# the VLM can actually see floor, thresholds, and low obstacles.
+EXPLORE_HEAD_PITCH        = -10
+
+# ── Dual-camera setup (ribbon cam for navigation) ─────────────────
+# The PiDog ships with a ribbon camera on the nose (forward-facing, level
+# with the floor). We use it as a dedicated "navigation eye" during
+# SEARCH/EXPLORE so the VLM reasons about doorways and obstacles instead
+# of whatever angle the webcam's head servo happens to be at.
+#
+# Wire-up:
+#   - Pi runs TWO pi_sender processes: webcam → ZMQ_PORT, ribbon → ZMQ_NAV_PORT
+#   - Mac follower.py binds both ports, pulls from each, passes nav frame
+#     to pipeline.process_frame(frame, nav_frame=...)
+#   - If the ribbon cam stream is unavailable, process_frame silently
+#     falls back to the webcam for explore queries — no failure mode.
+ZMQ_NAV_PORT              = 50506   # ribbon camera stream (nose, forward)
+USE_RIBBON_CAM            = True    # opt-in flag for dual-camera mode

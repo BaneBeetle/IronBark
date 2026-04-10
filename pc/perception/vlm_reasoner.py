@@ -44,8 +44,10 @@ class ExploreResponse:
 VALID_MODES = {"ACTIVE", "GENTLE", "CALM", "PLAYFUL", "SOCIAL"}
 VALID_DIRECTIONS = {"FORWARD", "LEFT", "RIGHT", "BACK"}
 
-SITUATION_PROMPT = """You are the vision system of a small robot dog following its owner.
+SITUATION_PROMPT_TEMPLATE = """You are the vision system of a small robot dog following its owner.
 Analyze the scene and choose the most appropriate behavior mode.
+
+{yolo_context}
 
 Respond with EXACTLY two lines:
 LINE 1 - SCENE: Brief description of the environment and what the owner is doing.
@@ -58,6 +60,14 @@ Rules:
 - PLAYFUL: Children present, energetic activity, owner reaching toward camera.
 - SOCIAL: Multiple people visible, owner talking to someone, gathering.
 - Default to ACTIVE if uncertain.
+
+Grounding rules (CRITICAL — read carefully):
+- A YOLO object detector has already analyzed this frame. Its person count is
+  authoritative — you MUST match it.
+- If YOLO detected 0 people, do NOT describe any person. The scene is empty
+  or contains only furniture. Respond with SCENE based on objects only.
+- Do NOT invent people, wheelchairs, medical equipment, or hospitals.
+- Describe only what is literally visible. If unsure, say "indoor room".
 
 Be concise. Respond with exactly two lines."""
 
@@ -241,13 +251,35 @@ class VLMReasoner:
 
     # ── Phase 6A: Situation query ──────────────────────────────────────
 
-    def situation_query(self, frame, jpeg_quality=75):
-        """Classify the scene into a behavior mode. Returns SituationResponse."""
+    def situation_query(self, frame, detection_count=None, jpeg_quality=75):
+        """
+        Classify the scene into a behavior mode. Returns SituationResponse.
+
+        detection_count (optional int): Number of people YOLO saw in this frame.
+            Passed into the prompt so the VLM is grounded in reality and stops
+            hallucinating people/wheelchairs/hospitals from furniture patterns.
+        """
         t_start = time.perf_counter()
         image_b64 = self._encode_frame(frame, jpeg_quality)
 
+        if detection_count is None:
+            yolo_context = ""
+        elif detection_count == 0:
+            yolo_context = (
+                "CRITICAL: YOLO detected 0 people in this frame. "
+                "The scene contains NO people — describe only furniture, "
+                "walls, and objects. Do not mention any person."
+            )
+        else:
+            yolo_context = (
+                f"CRITICAL: YOLO detected exactly {detection_count} person(s) "
+                "in this frame. Describe the visible person(s) only — do not "
+                "invent additional people."
+            )
+        prompt = SITUATION_PROMPT_TEMPLATE.format(yolo_context=yolo_context)
+
         payload = {
-            "model": self.model, "prompt": SITUATION_PROMPT,
+            "model": self.model, "prompt": prompt,
             "images": [image_b64], "stream": False,
             "options": {"temperature": 0.1, "num_predict": 80},
         }

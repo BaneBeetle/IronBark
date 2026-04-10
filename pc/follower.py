@@ -400,10 +400,14 @@ class Follower:
     def _search(self, now):
         # Smooth sinusoidal sweep ±35° over 4-second period.
         # Mac owns the head here (remote mode) — Pi applies these angles.
+        # Pitch down so we're looking forward/toward the floor for doorways,
+        # not up at the ceiling (head was pitched up during FOLLOW).
         elapsed = now - self.search_start_time
         head_yaw = 35.0 * math.sin(2 * math.pi * elapsed / 4.0)
         self._smoothed_head_yaw = head_yaw
-        return Command("stop", head_mode="remote", head_yaw=head_yaw)
+        pitch = getattr(config, "EXPLORE_HEAD_PITCH", -10)
+        return Command("stop", head_mode="remote",
+                       head_yaw=head_yaw, head_pitch=pitch)
 
     def _explore(self, now, result):
         """
@@ -421,6 +425,8 @@ class Follower:
         if self._explore_move_until > now:
             return self._last_explore_cmd
 
+        pitch = getattr(config, "EXPLORE_HEAD_PITCH", -10)
+
         # Check if VLM gave us a direction
         if self._explore_direction is not None:
             direction = self._explore_direction
@@ -431,21 +437,21 @@ class Follower:
 
             if direction == "FORWARD":
                 cmd = Command("forward", speed=speed, step_count=steps,
-                              head_mode="remote", head_yaw=0)
+                              head_mode="remote", head_yaw=0, head_pitch=pitch)
             elif direction == "LEFT":
                 cmd = Command("turn_left", speed=80, step_count=4,
-                              head_mode="remote", head_yaw=-30)
+                              head_mode="remote", head_yaw=-30, head_pitch=pitch)
             elif direction == "RIGHT":
                 cmd = Command("turn_right", speed=80, step_count=4,
-                              head_mode="remote", head_yaw=30)
+                              head_mode="remote", head_yaw=30, head_pitch=pitch)
             elif direction == "BACK":
                 # 180° turn — PiDog backward gait is useless, turn instead
                 back_steps = getattr(config, "VLM_EXPLORE_BACK_STEPS", 8)
                 cmd = Command("turn_left", speed=90, step_count=back_steps,
-                              head_mode="remote", head_yaw=0)
+                              head_mode="remote", head_yaw=0, head_pitch=pitch)
             else:
                 cmd = Command("forward", speed=speed, step_count=steps,
-                              head_mode="remote", head_yaw=0)
+                              head_mode="remote", head_yaw=0, head_pitch=pitch)
 
             # Hold this move for ~2 seconds before querying VLM again
             self._explore_move_until = now + 2.0
@@ -455,12 +461,13 @@ class Follower:
 
         # No direction yet — "thinking" animation while waiting for VLM.
         # Gentle head oscillation + thinking flag triggers Pi-side purple
-        # RGB + tail wag so the dog looks alive, not frozen.
+        # RGB + tail wag so the dog looks alive, not frozen. Pitch stays
+        # down so the ribbon cam / webcam sees something navigable.
         elapsed = now - self.search_start_time
         head_tilt = 15.0 * math.sin(2 * math.pi * elapsed / 2.5)
         self._smoothed_head_yaw = head_tilt
         return Command("stop", head_mode="remote", head_yaw=head_tilt,
-                       head_pitch=20, thinking=True)
+                       head_pitch=pitch, thinking=True)
 
     def _transition(self, new_state):
         if self.state != new_state:
@@ -494,12 +501,25 @@ if __name__ == "__main__":
     print("=" * 60)
 
     ctx = zmq.Context()
+    # Main (owner-tracking) stream — USB webcam mounted on the dog's head
     sock = ctx.socket(zmq.PULL)
     sock.setsockopt(zmq.CONFLATE, 1)
     sock.setsockopt(zmq.RCVHWM, 2)      # only buffer 2 frames max
     sock.setsockopt(zmq.RCVTIMEO, 1000)
     sock.bind(f"tcp://*:{config.ZMQ_PORT}")
-    print(f"[Main] PULL socket bound on port {config.ZMQ_PORT}")
+    print(f"[Main] PULL socket bound on port {config.ZMQ_PORT} (webcam)")
+
+    # Phase 6 dual-camera: navigation stream — ribbon camera on the nose.
+    # Optional — if the Pi isn't running a second pi_sender on ZMQ_NAV_PORT,
+    # nav_sock.recv returns zmq.Again and we fall back to the webcam.
+    nav_sock = None
+    if getattr(config, "USE_RIBBON_CAM", False):
+        nav_sock = ctx.socket(zmq.PULL)
+        nav_sock.setsockopt(zmq.CONFLATE, 1)
+        nav_sock.setsockopt(zmq.RCVHWM, 2)
+        nav_sock.setsockopt(zmq.RCVTIMEO, 100)
+        nav_sock.bind(f"tcp://*:{config.ZMQ_NAV_PORT}")
+        print(f"[Main] Nav PULL socket bound on port {config.ZMQ_NAV_PORT} (ribbon cam)")
 
     pipeline = PerceptionPipeline(config)
     pipeline.start()
@@ -527,6 +547,11 @@ if __name__ == "__main__":
         jpeg_data = raw[header_size:header_size + payload_len]
         return cv2.imdecode(np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
 
+    # Latest nav frame, refreshed each loop iteration. Held across iterations
+    # so we can forward the most recent available ribbon-cam frame to the
+    # VLM even if the ribbon cam pushes slower than the webcam.
+    latest_nav_frame = None
+
     try:
         while True:
             raw = get_latest_frame(sock)
@@ -546,7 +571,16 @@ if __name__ == "__main__":
             if frame is None:
                 continue
 
-            result = pipeline.process_frame(frame)
+            # Drain any pending nav frames (non-blocking). Only the latest
+            # survives — everything older is discarded (CONFLATE also helps).
+            if nav_sock is not None:
+                nav_raw = get_latest_frame(nav_sock)
+                if nav_raw is not None:
+                    decoded = decode_frame(nav_raw)
+                    if decoded is not None:
+                        latest_nav_frame = decoded
+
+            result = pipeline.process_frame(frame, nav_frame=latest_nav_frame)
             cmd = follower.update(result)
 
             display = pipeline.draw_overlay(frame, result)
@@ -594,4 +628,6 @@ if __name__ == "__main__":
         follower.close()
         pipeline.stop()
         sock.close()
+        if nav_sock is not None:
+            nav_sock.close()
         cv2.destroyAllWindows()

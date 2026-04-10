@@ -115,15 +115,18 @@ class PerceptionPipeline:
                 continue
             if item is None:
                 break
-            frame, query_type = item
+            # New tuple shape: (frame, query_type, detection_count)
+            # detection_count is the number of people YOLO saw in that frame,
+            # used to ground the VLM and prevent hallucinations.
+            frame, query_type, detection_count = item
             try:
                 if query_type == "situation":
-                    resp = self.vlm.situation_query(frame)
+                    resp = self.vlm.situation_query(frame, detection_count=detection_count)
                     with self._vlm_lock:
                         self._latest_situation = resp
                         self._situation_seq += 1
                     print(f"[VLM] Situation: MODE={resp.mode} "
-                          f"({resp.latency_ms:.0f}ms) | {resp.description[:60]}")
+                          f"({resp.latency_ms:.0f}ms) | yolo={detection_count} | {resp.description[:60]}")
                 elif query_type == "explore":
                     resp = self.vlm.explore_query(frame)
                     with self._vlm_lock:
@@ -198,7 +201,20 @@ class PerceptionPipeline:
         self._face_tracks = new_tracks
         return smoothed
 
-    def process_frame(self, frame: np.ndarray) -> PerceptionResult:
+    def process_frame(self, frame: np.ndarray,
+                      nav_frame: Optional[np.ndarray] = None) -> PerceptionResult:
+        """
+        Run perception on the owner-tracking frame (`frame`) and optionally
+        use a second frame (`nav_frame`) for EXPLORE-state VLM queries.
+
+        Intended wiring:
+          - `frame`     = webcam (head-mounted, pitched up for face tracking)
+          - `nav_frame` = ribbon camera (nose-mounted, level with floor)
+
+        During FOLLOW the webcam is used everywhere. During EXPLORE the
+        ribbon cam (if available) is forwarded to the VLM so it can reason
+        about doorways and floor-level features instead of the ceiling.
+        """
         t_start = time.perf_counter()
         self._frame_id += 1
 
@@ -237,21 +253,27 @@ class PerceptionPipeline:
         else:
             self._face_tracks = []
 
-        # Phase 6: Route VLM queries based on current mode
+        # Phase 6: Route VLM queries based on current mode.
+        # Every queue item is (frame, query_type, detection_count).
         now = time.time()
+        det_count = len(detections)
         if self._vlm_query_type == "situation":
-            # Throttle situation queries to every VLM_SITUATION_INTERVAL_S
+            # Throttle situation queries to every VLM_SITUATION_INTERVAL_S.
+            # Situation uses the webcam (owner tracking frame).
             interval = getattr(_cfg, "VLM_SITUATION_INTERVAL_S", 2.5)
             if now - self._last_situation_time >= interval:
                 try:
-                    self._vlm_queue.put_nowait((frame.copy(), "situation"))
+                    self._vlm_queue.put_nowait((frame.copy(), "situation", det_count))
                     self._last_situation_time = now
                 except Full:
                     pass
         elif self._vlm_query_type == "explore":
-            # Explore: submit as fast as the VLM can handle
+            # Explore: submit as fast as the VLM can handle.
+            # Prefer the ribbon cam (nav_frame) since it's level with the
+            # floor and sees doorways. Fall back to webcam if unavailable.
+            explore_src = nav_frame if nav_frame is not None else frame
             try:
-                self._vlm_queue.put_nowait((frame.copy(), "explore"))
+                self._vlm_queue.put_nowait((explore_src.copy(), "explore", det_count))
             except Full:
                 pass
 
