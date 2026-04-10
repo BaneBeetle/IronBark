@@ -55,8 +55,8 @@ def main():
     sock.setsockopt(zmq.CONFLATE, 1)
     sock.setsockopt(zmq.RCVHWM, 2)
     sock.setsockopt(zmq.RCVTIMEO, 2000)
-    sock.bind(f"tcp://*:{config.ZMQ_PORT}")
-    print(f"[Calibrate] PULL socket bound on port {config.ZMQ_PORT}")
+    sock.bind(f"tcp://{config.PC_IP}:{config.ZMQ_PORT}")
+    print(f"[Calibrate] PULL socket bound on {config.PC_IP}:{config.ZMQ_PORT}")
 
     # Perception (YOLO + ArcFace, no VLM needed but it starts anyway)
     pipeline = PerceptionPipeline(config)

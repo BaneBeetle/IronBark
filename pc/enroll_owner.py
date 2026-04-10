@@ -40,9 +40,9 @@ def main():
     ctx = zmq.Context()
     sock = ctx.socket(zmq.PULL)
     sock.setsockopt(zmq.CONFLATE, 1)
-    sock.bind(f"tcp://*:{config.ZMQ_PORT}")
+    sock.bind(f"tcp://{config.PC_IP}:{config.ZMQ_PORT}")
     sock.setsockopt(zmq.RCVTIMEO, 200)
-    print(f"[enroll_owner] ZMQ PULL bound on tcp://*:{config.ZMQ_PORT}")
+    print(f"[enroll_owner] ZMQ PULL bound on {config.PC_IP}:{config.ZMQ_PORT}")
 
     detector = YOLODetector(model_path=config.YOLO_MODEL, conf_threshold=0.4)
     recognizer = FaceRecognizer(

@@ -247,14 +247,14 @@ class MotorController:
         # SUB: teleop commands — bind on port 5557 (Mac connects to us)
         self.teleop_sock = self.ctx.socket(zmq.SUB)
         self.teleop_sock.setsockopt(zmq.CONFLATE, 1)
-        self.teleop_sock.bind(f"tcp://*:{TELEOP_CMD_PORT}")
+        self.teleop_sock.bind(f"tcp://{config.PI_IP}:{TELEOP_CMD_PORT}")
         self.teleop_sock.subscribe(b"")
-        print(f"[Motor] Teleop SUB bound on tcp://*:{TELEOP_CMD_PORT}")
+        print(f"[Motor] Teleop SUB bound on {config.PI_IP}:{TELEOP_CMD_PORT}")
 
         # PUB: telemetry — bind on port 5558 (Mac connects to us)
         self.telem_sock = self.ctx.socket(zmq.PUB)
-        self.telem_sock.bind(f"tcp://*:{TELEM_PORT}")
-        print(f"[Motor] Telemetry PUB bound on tcp://*:{TELEM_PORT}")
+        self.telem_sock.bind(f"tcp://{config.PI_IP}:{TELEM_PORT}")
+        print(f"[Motor] Telemetry PUB bound on {config.PI_IP}:{TELEM_PORT}")
 
         # Poller for multiplexing both command sources
         self.poller = zmq.Poller()

@@ -159,8 +159,8 @@ class Follower:
 
         self.ctx = zmq.Context()
         self.cmd_sock = self.ctx.socket(zmq.PUB)
-        self.cmd_sock.bind(f"tcp://*:{config.CMD_PORT}")
-        print(f"[Follower] Command PUB bound on port {config.CMD_PORT}")
+        self.cmd_sock.bind(f"tcp://{config.PC_IP}:{config.CMD_PORT}")
+        print(f"[Follower] Command PUB bound on {config.PC_IP}:{config.CMD_PORT}")
 
         self.telemetry = TelemetryReceiver(self.ctx)
 
@@ -506,8 +506,8 @@ if __name__ == "__main__":
     sock.setsockopt(zmq.CONFLATE, 1)
     sock.setsockopt(zmq.RCVHWM, 2)      # only buffer 2 frames max
     sock.setsockopt(zmq.RCVTIMEO, 1000)
-    sock.bind(f"tcp://*:{config.ZMQ_PORT}")
-    print(f"[Main] PULL socket bound on port {config.ZMQ_PORT} (webcam)")
+    sock.bind(f"tcp://{config.PC_IP}:{config.ZMQ_PORT}")
+    print(f"[Main] PULL socket bound on {config.PC_IP}:{config.ZMQ_PORT} (webcam)")
 
     # Phase 6 dual-camera: navigation stream — ribbon camera on the nose.
     # Optional — if the Pi isn't running a second pi_sender on ZMQ_NAV_PORT,
@@ -518,8 +518,8 @@ if __name__ == "__main__":
         nav_sock.setsockopt(zmq.CONFLATE, 1)
         nav_sock.setsockopt(zmq.RCVHWM, 2)
         nav_sock.setsockopt(zmq.RCVTIMEO, 100)
-        nav_sock.bind(f"tcp://*:{config.ZMQ_NAV_PORT}")
-        print(f"[Main] Nav PULL socket bound on port {config.ZMQ_NAV_PORT} (ribbon cam)")
+        nav_sock.bind(f"tcp://{config.PC_IP}:{config.ZMQ_NAV_PORT}")
+        print(f"[Main] Nav PULL socket bound on {config.PC_IP}:{config.ZMQ_NAV_PORT} (ribbon cam)")
 
     pipeline = PerceptionPipeline(config)
     pipeline.start()

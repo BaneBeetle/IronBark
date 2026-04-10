@@ -86,14 +86,14 @@ class RemoteController:
         self.cmd_sock = self.ctx.socket(zmq.SUB)
         self.cmd_sock.setsockopt(zmq.CONFLATE, 1)  # keep only latest
         self.cmd_sock.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout
-        self.cmd_sock.bind(f"tcp://*:{CMD_PORT}")
+        self.cmd_sock.bind(f"tcp://{config.PI_IP}:{CMD_PORT}")
         self.cmd_sock.subscribe(b"")
-        print(f"[RC] CMD SUB bound on tcp://*:{CMD_PORT}")
+        print(f"[RC] CMD SUB bound on {config.PI_IP}:{CMD_PORT}")
 
         # PUB socket: send telemetry back to Mac
         self.telem_sock = self.ctx.socket(zmq.PUB)
-        self.telem_sock.bind(f"tcp://*:{TELEM_PORT}")
-        print(f"[RC] TELEM PUB bound on tcp://*:{TELEM_PORT}")
+        self.telem_sock.bind(f"tcp://{config.PI_IP}:{TELEM_PORT}")
+        print(f"[RC] TELEM PUB bound on {config.PI_IP}:{TELEM_PORT}")
 
         # Register cleanup for SIGTERM (plain `kill`) and atexit
         signal.signal(signal.SIGTERM, self._signal_handler)

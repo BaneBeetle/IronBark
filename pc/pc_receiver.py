@@ -21,8 +21,8 @@ def main():
     sock.setsockopt(zmq.RCVHWM, 10)
     sock.setsockopt(zmq.LINGER, 0)
     sock.setsockopt(zmq.RCVTIMEO, 2000)
-    sock.bind(f"tcp://*:{config.ZMQ_PORT}")
-    print(f"[ZMQ] Listening on tcp://*:{config.ZMQ_PORT}")
+    sock.bind(f"tcp://{config.PC_IP}:{config.ZMQ_PORT}")
+    print(f"[ZMQ] Listening on {config.PC_IP}:{config.ZMQ_PORT}")
 
     cv2.namedWindow("IronBark Feed", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("IronBark Feed", 1280, 720)
