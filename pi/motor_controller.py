@@ -740,7 +740,10 @@ class MotorController:
             print(f"[Motor] -> STOP ({source})")
 
         elif action in self.ACTION_MAP:
-            self.dog.legs_stop()
+            # No legs_stop() — don't flush the buffer. Old gait frames
+            # finish naturally, then new frames (starting from the closest
+            # frame to current servo position) follow seamlessly. This
+            # eliminates the servo snap on action changes.
             self._issue_action(action, step_count, speed)
             self.dog.do_action("wag_tail", step_count=5, speed=99)
             self.dog.rgb_strip.set_mode("breath", "green", bps=1)
@@ -770,21 +773,54 @@ class MotorController:
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
+    def _find_closest_frame(self, frames):
+        """
+        Find which frame in the gait cycle is closest to the current
+        servo positions. Returns the index to start playback from.
+        This eliminates the jerk caused by snapping to frame 0 when
+        the servos are mid-cycle at a different position.
+        """
+        current = self.dog.leg_current_angles
+        best_idx = 0
+        best_dist = float('inf')
+        for i, frame in enumerate(frames):
+            dist = sum((a - b) ** 2 for a, b in zip(current, frame))
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        return best_idx
+
     def _issue_action(self, action, step_count, speed):
         """
-        Issue a movement action — routes to custom sharp turns or SDK gaits.
-        Sharp turns use pre-generated frames via legs_move() directly,
-        bypassing the SDK's gentle TURNING_RATE=0.3 arc turns.
+        Issue a movement action with smooth frame alignment.
+        Instead of always starting from frame 0 (causing a servo snap),
+        find the closest frame to the current servo positions and start
+        playback from there. The gait is cyclic so any start point works.
         """
         sdk_name = self.ACTION_MAP.get(action, action)
+
         if sdk_name in self._sharp_turns:
-            # Custom sharp turn — feed frames directly
             angles, _ = self._sharp_turns[sdk_name]
-            for _ in range(step_count):
-                self.dog.legs_move(angles, immediately=False, speed=speed)
         else:
-            # Standard SDK action (forward, backward, etc.)
-            self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
+            # Get SDK gait frames
+            try:
+                angles, part = self.dog.actions_dict[sdk_name]
+                if part != "legs":
+                    self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
+                    return
+            except (KeyError, Exception):
+                self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
+                return
+
+        # Find closest frame and reorder cycle to start there
+        start = self._find_closest_frame(angles)
+        if start > 0:
+            reordered = angles[start:] + angles[:start]
+        else:
+            reordered = angles
+
+        for _ in range(step_count):
+            self.dog.legs_move(reordered, immediately=False, speed=speed)
 
     def _bark_warning(self):
         """Danger bark — head-only, same pattern as arrival bark."""

@@ -24,7 +24,7 @@ REMOTE="${PI_DEPLOY_PATH:-~/ironbark}"
 echo "Deploying IronBark to ${PI_TARGET}:${REMOTE}..."
 ssh "$PI_TARGET" "mkdir -p $REMOTE"
 scp config.py .env "${PI_TARGET}:${REMOTE}/"
-scp pi/pi_sender.py pi/motor_controller.py pi/remote_control.py "${PI_TARGET}:${REMOTE}/"
+scp pi/pi_sender.py pi/motor_controller.py pi/remote_control.py pi/lidar_reader.py pi/test_lidar.py "${PI_TARGET}:${REMOTE}/"
 
 echo "Verifying..."
 ssh "$PI_TARGET" "ls -la $REMOTE/"
