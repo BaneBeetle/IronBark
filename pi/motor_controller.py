@@ -379,9 +379,44 @@ class MotorController:
     ACTION_MAP = {
         "forward":    "forward",
         "backward":   "backward",
-        "turn_left":  "turn_left",
-        "turn_right": "turn_right",
+        "turn_left":  "sharp_turn_left",
+        "turn_right": "sharp_turn_right",
     }
+
+    @staticmethod
+    def _generate_sharp_turns():
+        """
+        Generate sharp pivot turns by setting inner leg step scale to 0.
+        Inner legs stay planted, outer legs push around them.
+
+        In-place rotation isn't feasible with PiDog's 2-DOF legs (no hip
+        abduction = no lateral push). The pivot turn is the sharpest
+        rotation this hardware can do.
+        """
+        from pidog.walk import Walk
+
+        orig_scales = Walk.LEG_STEP_SCALES
+
+        # Inner legs at 0% — pure pivot around the inner side
+        Walk.LEG_STEP_SCALES = [
+            [0.0, 1.0, 0.0, 1.0],   # LEFT: left legs plant
+            [1.0, 1.0, 1.0, 1.0],   # STRAIGHT
+            [1.0, 0.0, 1.0, 0.0],   # RIGHT: right legs plant
+        ]
+
+        left_walk = Walk(fb=Walk.FORWARD, lr=Walk.LEFT)
+        left_coords = left_walk.get_coords()
+        left_angles = [Pidog.legs_angle_calculation(c) for c in left_coords]
+
+        right_walk = Walk(fb=Walk.FORWARD, lr=Walk.RIGHT)
+        right_coords = right_walk.get_coords()
+        right_angles = [Pidog.legs_angle_calculation(c) for c in right_coords]
+
+        Walk.LEG_STEP_SCALES = orig_scales
+
+        print(f"[Motor] Generated sharp pivot turns: "
+              f"{len(left_angles)} frames/cycle (inner legs at 0%)")
+        return left_angles, right_angles
 
     def __init__(self):
         print("=" * 60)
@@ -399,6 +434,13 @@ class MotorController:
         self.dog.do_action("stand", speed=80)
         self.dog.wait_all_done()
         time.sleep(0.5)
+
+        # ── Generate sharp pivot turn gaits ───────────────────────
+        rotate_left, rotate_right = self._generate_sharp_turns()
+        self._sharp_turns = {
+            "sharp_turn_left": (rotate_left, "legs"),
+            "sharp_turn_right": (rotate_right, "legs"),
+        }
 
         # ── Register cleanup for ANY exit (SIGTERM, atexit, etc.) ──
         # SIGTERM (plain `kill`) — triggers graceful shutdown
@@ -673,24 +715,17 @@ class MotorController:
             return
 
         # Same action continuing — refill gait buffer BEFORE it empties.
-        # A brief pause between gait cycles lets servos settle and gives
-        # the Mac time to send corrected commands before the next cycle.
         if action == self.current_action:
             if action in self.ACTION_MAP:
                 buf_len = len(self.dog.legs_action_buffer)
                 if buf_len == 0:
-                    # Gait just finished — pause briefly before refilling.
-                    # This dampens explosive servo transitions and lets the
-                    # follower re-evaluate during the gap.
                     now = time.time()
                     if now - self.gait_done_time < 0.08:  # 80ms settle pause
-                        return  # still in pause window, skip this cycle
+                        return
                     self.gait_done_time = now
-                    sdk_name = self.ACTION_MAP[action]
-                    self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
+                    self._issue_action(action, step_count, speed)
                 elif buf_len < 6:
-                    sdk_name = self.ACTION_MAP[action]
-                    self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
+                    self._issue_action(action, step_count, speed)
             return
 
         # ── Action changed ──────────────────────────────────────────
@@ -705,14 +740,8 @@ class MotorController:
             print(f"[Motor] -> STOP ({source})")
 
         elif action in self.ACTION_MAP:
-            # Flush old gait buffer on action change (e.g. backward→forward).
-            # Without this, remaining backward frames play out first, making
-            # the dog move the wrong direction. The brief servo snap from
-            # legs_stop() is acceptable — it's a one-time reset, not a
-            # continuous lurch like the is_legs_done() approach causes.
             self.dog.legs_stop()
-            sdk_name = self.ACTION_MAP[action]
-            self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
+            self._issue_action(action, step_count, speed)
             self.dog.do_action("wag_tail", step_count=5, speed=99)
             self.dog.rgb_strip.set_mode("breath", "green", bps=1)
             self.gait_done_time = time.time()
@@ -740,6 +769,22 @@ class MotorController:
             print(f"[Motor] -> LIE ({source})")
 
     # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _issue_action(self, action, step_count, speed):
+        """
+        Issue a movement action — routes to custom sharp turns or SDK gaits.
+        Sharp turns use pre-generated frames via legs_move() directly,
+        bypassing the SDK's gentle TURNING_RATE=0.3 arc turns.
+        """
+        sdk_name = self.ACTION_MAP.get(action, action)
+        if sdk_name in self._sharp_turns:
+            # Custom sharp turn — feed frames directly
+            angles, _ = self._sharp_turns[sdk_name]
+            for _ in range(step_count):
+                self.dog.legs_move(angles, immediately=False, speed=speed)
+        else:
+            # Standard SDK action (forward, backward, etc.)
+            self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
 
     def _bark_warning(self):
         """Danger bark — head-only, same pattern as arrival bark."""
