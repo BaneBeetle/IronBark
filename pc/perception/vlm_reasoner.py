@@ -71,21 +71,39 @@ Grounding rules (CRITICAL — read carefully):
 
 Be concise. Respond with exactly two lines."""
 
-EXPLORE_PROMPT = """You are a small robot dog that has lost its owner and is searching for them in a home.
-Analyze this image and decide which direction to explore to find them.
+EXPLORE_PROMPT = """You are a small robot dog exploring a home. Look at this image carefully.
 
 Respond with EXACTLY two lines:
-LINE 1 - SCENE: Brief description of what you see (doorways, hallways, open spaces, walls).
+LINE 1 - SCENE: What do you see? (wall, furniture, doorway, hallway, open floor)
 LINE 2 - DIRECTION: Exactly one of: FORWARD, LEFT, RIGHT, BACK
 
-Rules:
-- FORWARD: Open space, doorway, or hallway ahead worth exploring.
-- LEFT: Doorway, opening, or unexplored space to the left.
-- RIGHT: Doorway, opening, or unexplored space to the right.
-- BACK: Dead end, wall ahead, or nothing useful — turn around.
-- Prefer doorways and open spaces over walls and furniture.
+Decision rules (follow strictly):
+- If you see a WALL, CABINET, FURNITURE SURFACE, or SOLID OBJECT filling most of the frame → BACK
+- If the path ahead is BLOCKED or very close to an object → BACK
+- If you see a DOORWAY or OPENING to the LEFT → LEFT
+- If you see a DOORWAY or OPENING to the RIGHT → RIGHT
+- ONLY choose FORWARD if there is clearly OPEN FLOOR or a DOORWAY directly ahead
+- When in doubt, choose BACK. Do NOT default to FORWARD.
 
 Be concise. Respond with exactly two lines."""
+
+OBSTACLE_PROMPT = """There is an obstacle directly ahead of this robot dog. Look at this image.
+
+Which side has MORE open space — LEFT or RIGHT?
+
+Respond with EXACTLY two lines:
+LINE 1 - OBSTACLE: What is blocking the path? (one short phrase)
+LINE 2 - CLEAR: LEFT or RIGHT
+
+Rules:
+- You MUST choose either LEFT or RIGHT. No other answer.
+- If the obstacle is on the RIGHT side of the image → LEFT
+- If the obstacle is on the LEFT side of the image → RIGHT
+- If both sides look similar, pick the side with more visible floor.
+
+Respond with exactly two lines."""
+
+VALID_OBSTACLE_DIRS = {"LEFT", "RIGHT"}
 
 NAVIGATION_PROMPT_TEMPLATE = """You are the vision system of a small robot dog following its owner.
 Analyze this image and respond with EXACTLY two lines:
@@ -365,6 +383,58 @@ class VLMReasoner:
             elif upper.startswith("DIRECTION:"):
                 token = stripped.split(":", 1)[1].strip().upper()
                 if token in VALID_DIRECTIONS:
+                    direction = token
+        return direction, reasoning
+
+    # ── Obstacle avoidance query (ribbon cam) ────────────────────────
+
+    def obstacle_query(self, frame, jpeg_quality=75):
+        """
+        Ask VLM which direction is clear when an obstacle is detected.
+        Uses the ribbon cam (nose-mounted, level with floor).
+        Returns ExploreResponse with direction = LEFT/RIGHT/BACK.
+        """
+        t_start = time.perf_counter()
+        image_b64 = self._encode_frame(frame, jpeg_quality)
+
+        payload = {
+            "model": self.model, "prompt": OBSTACLE_PROMPT,
+            "images": [image_b64], "stream": False,
+            "options": {"temperature": 0.1, "num_predict": 60},
+        }
+
+        raw_text = ""
+        try:
+            response = requests.post(self._generate_url, json=payload,
+                                     timeout=self.timeout_s)
+            response.raise_for_status()
+            raw_text = response.json().get("response", "").strip()
+        except Exception as e:
+            raw_text = f"ERROR: {e}"
+
+        latency_ms = (time.perf_counter() - t_start) * 1000.0
+        direction, reasoning = self._parse_obstacle(raw_text)
+        return ExploreResponse(direction=direction, reasoning=reasoning,
+                               latency_ms=latency_ms, model=self.model)
+
+    def _parse_obstacle(self, raw_text):
+        """Extract CLEAR direction and OBSTACLE description."""
+        reasoning = ""
+        direction = "LEFT"  # default to LEFT if parsing fails (never BACK)
+        for line in raw_text.split("\n"):
+            stripped = line.strip()
+            upper = stripped.upper()
+            for prefix in ["LINE 1 -", "LINE 2 -", "LINE 1:", "LINE 2:",
+                           "1.", "2.", "1)", "2)"]:
+                if upper.startswith(prefix):
+                    stripped = stripped[len(prefix):].strip()
+                    upper = stripped.upper()
+                    break
+            if upper.startswith("OBSTACLE:"):
+                reasoning = stripped.split(":", 1)[1].strip()
+            elif upper.startswith("CLEAR:"):
+                token = stripped.split(":", 1)[1].strip().upper()
+                if token in VALID_OBSTACLE_DIRS:
                     direction = token
         return direction, reasoning
 

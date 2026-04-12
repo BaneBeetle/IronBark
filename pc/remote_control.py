@@ -148,8 +148,19 @@ def main(stdscr):
                     action = current_action
 
             # ── Send command ─────────────────────────────────────────
-            cmd = json.dumps({"action": action})
-            cmd_sock.send_string(cmd)
+            # Forward gets high step_count (8) to avoid servo-reset lurch.
+            # Turns keep step_count=4 for responsiveness.
+            fwd_steps = getattr(config, "FORWARD_STEP_COUNT", 8)
+            is_forward = action in ("forward", "backward")
+            cmd_dict = {
+                "action": action,
+                "speed": 98,
+                "step_count": fwd_steps if is_forward else 4,
+                "head_mode": "remote",
+                "head_yaw": 0,
+                "head_pitch": config.HEAD_DEFAULT_PITCH,
+            }
+            cmd_sock.send_string(json.dumps(cmd_dict))
             current_action = action
             send_count += 1
 

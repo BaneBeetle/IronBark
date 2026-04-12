@@ -190,6 +190,186 @@ class LocalHeadTracker:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Obstacle Scan Routine — backup + head sweep to find clear direction
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ObstacleScanRoutine:
+    """
+    Pi-side state machine that backs up, sweeps the head-mounted ultrasonic
+    sensor left/center/right, and picks the direction with the most clearance.
+
+    Runs inside the motor controller's 20Hz loop (not a separate thread).
+    Call step() once per loop iteration. When state reaches DONE, read
+    self.result for the chosen direction.
+    """
+
+    # States
+    IDLE = "idle"
+    BACKING_UP = "backing_up"
+    SETTLING = "settling"
+    SWEEPING = "sweeping"
+    READING = "reading"
+    DONE = "done"
+
+    def __init__(self, dog):
+        self.dog = dog
+        self.state = self.IDLE
+        self.result = None            # "turn_left" / "turn_right" / "forward"
+        self.distances = {}           # {"left": avg, "center": avg, "right": avg}
+        self._phase_start = 0.0
+        self._sweep_index = 0         # which sweep position we're on (0, 1, 2)
+        self._readings = []           # accumulated readings at current position
+        self._last_read_time = 0.0
+        self._result_time = 0.0       # when result was produced (for expiry)
+
+        # Config
+        self._angles = getattr(config, "SCAN_SWEEP_ANGLES", [-30, 0, 30])
+        self._pitch = getattr(config, "SCAN_SWEEP_PITCH", 0)
+        self._settle_s = getattr(config, "SCAN_SETTLE_TIME_S", 0.4)
+        self._readings_per = getattr(config, "SCAN_READINGS_PER_POSITION", 3)
+        self._read_interval = getattr(config, "SCAN_READING_INTERVAL_S", 0.1)
+        self._backup_steps = getattr(config, "SCAN_BACKUP_STEPS", 4)
+        self._backup_speed = getattr(config, "SCAN_BACKUP_SPEED", 80)
+        self._backup_duration = getattr(config, "SCAN_BACKUP_DURATION_S", 1.5)
+        self._post_backup_settle = getattr(config, "SCAN_POST_BACKUP_SETTLE_S", 0.3)
+        self._corner_threshold = getattr(config, "SCAN_CORNER_THRESHOLD_CM", 35)
+        self._result_expire = getattr(config, "SCAN_RESULT_EXPIRE_S", 5.0)
+        self._angle_names = ["left", "center", "right"]
+
+    def start(self):
+        """Begin a new scan. Call from the main loop when obstacle detected."""
+        if self.state != self.IDLE:
+            return  # already scanning
+        print("[Scan] Starting obstacle scan — backing up")
+        self.state = self.BACKING_UP
+        self.result = None
+        self.distances = {}
+        self._sweep_index = 0
+        self._phase_start = time.time()
+        self.dog.body_stop()
+        self.dog.do_action("backward", step_count=self._backup_steps,
+                           speed=self._backup_speed)
+
+    def step(self, current_distance):
+        """
+        Call once per main-loop iteration. Advances the scan state machine.
+        Returns True while scanning, False when idle/done.
+        """
+        now = time.time()
+
+        if self.state == self.IDLE:
+            # Auto-expire result after SCAN_RESULT_EXPIRE_S
+            if (self.result is not None and
+                    now - self._result_time > self._result_expire):
+                self.result = None
+                self.distances = {}
+            return False
+
+        if self.state == self.BACKING_UP:
+            if now - self._phase_start >= self._backup_duration:
+                self.dog.body_stop()
+                self._phase_start = now
+                self.state = self.SETTLING
+                print("[Scan] Backup done — settling")
+            return True
+
+        if self.state == self.SETTLING:
+            if now - self._phase_start >= self._post_backup_settle:
+                # Start first sweep position
+                self._start_sweep(now)
+            return True
+
+        if self.state == self.SWEEPING:
+            # Wait for head servo to reach position
+            if now - self._phase_start >= self._settle_s:
+                self.state = self.READING
+                self._readings = []
+                self._last_read_time = 0.0
+            return True
+
+        if self.state == self.READING:
+            # Collect readings at this position
+            if now - self._last_read_time >= self._read_interval:
+                dist = current_distance
+                if 2 < dist < 400:  # valid HC-SR04 range
+                    self._readings.append(dist)
+                self._last_read_time = now
+
+            if len(self._readings) >= self._readings_per:
+                # Average and store
+                name = self._angle_names[self._sweep_index]
+                avg = sum(self._readings) / len(self._readings)
+                self.distances[name] = round(avg, 1)
+                angle = self._angles[self._sweep_index]
+                print(f"[Scan] {name} ({angle}°): {avg:.1f}cm")
+
+                # Move to next position or finish
+                self._sweep_index += 1
+                if self._sweep_index < len(self._angles):
+                    self._start_sweep(now)
+                else:
+                    self._finish_scan()
+            return True
+
+        if self.state == self.DONE:
+            # Stay in DONE briefly so telemetry publishes the result,
+            # then transition to IDLE
+            self.state = self.IDLE
+            return False
+
+        return False
+
+    def _start_sweep(self, now):
+        """Move head to the next sweep position."""
+        angle = self._angles[self._sweep_index]
+        self.dog.head_move([[angle, 0, self._pitch]], speed=80)
+        self._phase_start = now
+        self.state = self.SWEEPING
+
+    def _finish_scan(self):
+        """Compare distances and pick the best direction."""
+        # Return head to center
+        self.dog.head_move([[0, 0, config.HEAD_DEFAULT_PITCH]], speed=80)
+
+        left = self.distances.get("left", 0)
+        center = self.distances.get("center", 0)
+        right = self.distances.get("right", 0)
+
+        # Corner detection — all directions blocked
+        if (left < self._corner_threshold and
+                center < self._corner_threshold and
+                right < self._corner_threshold):
+            self.result = "turn_around"
+            print(f"[Scan] CORNER — all blocked (L={left} C={center} R={right}). 180° turn.")
+        elif center >= left and center >= right and center > self._corner_threshold:
+            self.result = "forward"
+            print(f"[Scan] FORWARD clear (L={left} C={center} R={right})")
+        elif left >= right:
+            self.result = "turn_left"
+            print(f"[Scan] LEFT clearest (L={left} C={center} R={right})")
+        else:
+            self.result = "turn_right"
+            print(f"[Scan] RIGHT clearest (L={left} C={center} R={right})")
+
+        self._result_time = time.time()
+        self.state = self.DONE
+
+    def get_telemetry(self):
+        """Return scan state for inclusion in telemetry JSON."""
+        if self.state == self.IDLE:
+            state_str = "done" if self.result is not None else "idle"
+        elif self.state == self.DONE:
+            state_str = "done"
+        else:
+            state_str = "scanning"
+        return {
+            "scan_state": state_str,
+            "scan_result": self.result,
+            "scan_distances": self.distances if self.distances else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Motor Controller
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -233,6 +413,10 @@ class MotorController:
         # ── Pi-side head tracker (Part B) ──────────────────────────
         self.head_tracker = LocalHeadTracker()
         self.head_mode = "remote"   # default: Mac controls head
+
+        # ── Obstacle scan routine ─────────────────────────────────
+        self.scan_routine = ObstacleScanRoutine(self.dog)
+        self.scanning = False
 
         # ── ZMQ sockets ────────────────────────────────────────────
         self.ctx = zmq.Context()
@@ -282,27 +466,50 @@ class MotorController:
                 # Read ultrasonic
                 distance = round(self.dog.read_distance(), 2)
 
+                # ── Obstacle scan routine ─────────────────────────
+                # If a scan is active, the scan owns the dog. Skip normal
+                # command processing — the scan handles backup, head sweep,
+                # and distance reading internally.
+                if self.scanning:
+                    still_scanning = self.scan_routine.step(distance)
+                    if not still_scanning:
+                        self.scanning = False
+                        result = self.scan_routine.result
+                        print(f"[Motor] Scan complete: {result}")
+                        self.dog.rgb_strip.set_mode("breath", "blue", bps=0.5)
+                    # Publish telemetry even during scan
+                    now = time.time()
+                    if now - self.last_telem_time >= 0.2:
+                        self._send_telemetry(distance)
+                        self.last_telem_time = now
+                    time.sleep(0.05)
+                    continue
+
                 # Poll both command sources
                 action, speed, step_count, head_yaw, head_pitch, bark, \
                     source, head_mode, owner_bbox, \
                     bark_volume, idle_pose, thinking = self._receive_command()
 
+                # ── Handle obstacle_scan command from Mac ──────────
+                if action == "obstacle_scan" and not self.scanning:
+                    self.scanning = True
+                    self.scan_routine.start()
+                    self.dog.rgb_strip.set_mode("bark", "yellow", bps=2)
+                    # Publish telemetry immediately so Mac sees "scanning"
+                    self._send_telemetry(distance)
+                    time.sleep(0.05)
+                    continue
+
                 # ── Update head tracker state ──────────────────────
-                # If this command has a bbox, feed it to the tracker.
-                # If not, the tracker keeps its last known bbox (coasting).
                 if owner_bbox is not None:
                     self.head_tracker.update_bbox(owner_bbox)
                 if head_mode is not None:
                     self.head_mode = head_mode
 
-                # Ultrasonic danger zone (hard safety net)
-                # Block forward movement, but ALLOW turns — the Mac sends
-                # redirect turns during danger to pivot the dog away from
-                # the obstacle. Turns include some forward movement but
-                # the lateral component moves the dog out of danger.
+                # Ultrasonic danger zone (hard safety net, last resort)
+                # Only fires when NOT scanning (scan handles its own safety).
                 if 0 < distance < DANGER_DISTANCE:
                     if action == "forward":
-                        # Pure forward into obstacle — block it
                         if not self.danger:
                             print(f"\033[0;31m[Motor] DANGER! {distance}cm "
                                   f"— blocking forward\033[m")
@@ -314,14 +521,11 @@ class MotorController:
                             self._bark_warning()
                         action = "stop"
                     elif action in ("turn_left", "turn_right"):
-                        # Redirect turn — allow it through (Mac is pivoting
-                        # the dog away from the obstacle toward the owner)
                         if not self.danger:
                             print(f"\033[0;33m[Motor] DANGER {distance}cm "
-                                  f"— redirecting {action}\033[m")
+                                  f"— allowing {action}\033[m")
                         self.danger = True
                         self.dog.rgb_strip.set_mode("bark", "yellow", bps=2)
-                        # action passes through to _execute() as-is
                 else:
                     if self.danger:
                         print("\033[0;32m[Motor] Clear — danger resolved\033[m")
@@ -335,6 +539,13 @@ class MotorController:
                     angles = self.head_tracker.compute_head_angles()
                     if angles:
                         yaw, pitch = angles
+                        # Cap head yaw during forward walk to prevent drift.
+                        # The head is heavy — turning it shifts the center of
+                        # gravity and biases the gait sideways. During forward
+                        # movement, limit yaw to ±12° (fine tracking only).
+                        # Body turns handle large offsets instead.
+                        if action in ("forward", "backward"):
+                            yaw = max(-12, min(12, yaw))
                         self.dog.head_move([[yaw, 0, pitch]], speed=80)
                 elif head_yaw is not None or head_pitch is not None:
                     # Remote mode — apply Mac's commanded angles
@@ -461,22 +672,25 @@ class MotorController:
             self.current_action = "stop"
             return
 
-        # Same action continuing
+        # Same action continuing — refill gait buffer BEFORE it empties.
+        # A brief pause between gait cycles lets servos settle and gives
+        # the Mac time to send corrected commands before the next cycle.
         if action == self.current_action:
             if action in self.ACTION_MAP:
-                # Movement action — re-issue gait when legs finish
-                if self.dog.is_legs_done():
-                    # Follow-me pacing: brief pause between gaits
-                    if source == "follow":
-                        now = time.time()
-                        if now - self.gait_done_time < FOLLOW_GAIT_PAUSE_S:
-                            return
-                        self.gait_done_time = now
-
+                buf_len = len(self.dog.legs_action_buffer)
+                if buf_len == 0:
+                    # Gait just finished — pause briefly before refilling.
+                    # This dampens explosive servo transitions and lets the
+                    # follower re-evaluate during the gap.
+                    now = time.time()
+                    if now - self.gait_done_time < 0.08:  # 80ms settle pause
+                        return  # still in pause window, skip this cycle
+                    self.gait_done_time = now
                     sdk_name = self.ACTION_MAP[action]
                     self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
-            # Non-movement (stop/stand/sit/lie) — already in this state,
-            # don't re-issue body_stop() or it cancels head movements.
+                elif buf_len < 6:
+                    sdk_name = self.ACTION_MAP[action]
+                    self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
             return
 
         # ── Action changed ──────────────────────────────────────────
@@ -491,6 +705,12 @@ class MotorController:
             print(f"[Motor] -> STOP ({source})")
 
         elif action in self.ACTION_MAP:
+            # Flush old gait buffer on action change (e.g. backward→forward).
+            # Without this, remaining backward frames play out first, making
+            # the dog move the wrong direction. The brief servo snap from
+            # legs_stop() is acceptable — it's a one-time reset, not a
+            # continuous lurch like the is_legs_done() approach causes.
+            self.dog.legs_stop()
             sdk_name = self.ACTION_MAP[action]
             self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
             self.dog.do_action("wag_tail", step_count=5, speed=99)
@@ -540,6 +760,7 @@ class MotorController:
         except Exception:
             battery = 0.0
 
+        scan_telem = self.scan_routine.get_telemetry()
         telem = {
             "distance_cm": distance,
             "battery_v": battery,
@@ -547,6 +768,9 @@ class MotorController:
             "danger": self.danger,
             "source": self.source,
             "timestamp": time.time(),
+            "scan_state": scan_telem["scan_state"],
+            "scan_result": scan_telem["scan_result"],
+            "scan_distances": scan_telem["scan_distances"],
         }
         try:
             self.telem_sock.send_string(json.dumps(telem))

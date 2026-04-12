@@ -74,11 +74,38 @@ CMD_PORT = 5556
 FRAME_CENTER_X     = 320
 STEERING_DEAD_ZONE = 100
 TARGET_AREA_RATIO  = 0.12
-BODY_TURN_THRESHOLD = 120     # pixels from center before body turns (generous margin)
+BODY_TURN_THRESHOLD = 80      # pixels from center before body turns (tighter = less drift)
+BODY_TURN_STEP_COUNT = 12     # gait cycles per turn — strong committed turn like obstacle avoidance
+FORWARD_STEP_COUNT = 8        # gait cycles per forward (was 2; reduces lurch-on-restart drift)
 MIN_AREA_RATIO     = 0.02
 
 ULTRASONIC_STOP_CM  = 35
 ULTRASONIC_SLOW_CM  = 60
+
+# ── Phase 7: RPLidar C1 (360° obstacle avoidance) ─────────────────
+# Replaces the ultrasonic head-sweep scan with continuous 360° LiDAR.
+# The LiDAR is body-mounted and head-independent — no more blind spots.
+ZMQ_LIDAR_PORT            = 50507           # Pi → Mac: LiDAR scan stream
+USE_LIDAR                 = True            # enable LiDAR obstacle avoidance
+LIDAR_STALE_S             = 1.0             # ignore scans older than this (seconds)
+
+# Arc definitions (degrees, clockwise: 0=forward, 90=right, 180=behind, 270=left)
+LIDAR_FORWARD_ARC_HALF    = 30              # forward = 330° to 30° (60° wide)
+LIDAR_OBSTACLE_CM         = 35              # trigger avoidance below this (cm)
+LIDAR_DANGER_CM           = 15              # hard stop below this (cm)
+
+# Obstacle avoidance behavior
+LIDAR_TURN_STEP_COUNT     = 12              # gait cycles for obstacle turn (~90°)
+LIDAR_TURN_HOLD_S         = 2.0             # seconds to hold turn before re-checking
+LIDAR_BACKUP_SPEED        = 80              # speed when backing away
+LIDAR_BACKUP_STEP_COUNT   = 6              # gait cycles for backup
+
+# Legacy ultrasonic (kept as fallback if LiDAR unavailable)
+
+# ── 3-phase maneuver (Mac-side obstacle avoidance) ────────────────
+MANEUVER_CLEARING_DURATION_S = 3.5   # seconds to walk forward past obstacle edge
+MANEUVER_MAX_RETRIES         = 2     # max clearing re-turns before aborting
+NAV_FRAME_MAX_AGE_S          = 2.0   # discard ribbon cam frame older than this
 
 BARK_HEAD_PITCH     = 35        # Look all the way up during arrival bark
 
@@ -97,7 +124,7 @@ FOLLOW_GAIT_PAUSE_S = 0.05     # pause between follow-me gaits (was 0.2)
 #
 # CALIBRATION: Run follower.py and watch the "[FOLLOW] area=X.XXX" log.
 #   Stand at "arrived" distance (~3 feet) → note the ratio → set ARRIVED
-ARRIVAL_ARRIVED_RATIO = 0.40    # bbox > 40% → arrived! stop and bark
+ARRIVAL_ARRIVED_RATIO = 0.55    # bbox > 55% → arrived! (~1.5 feet instead of ~3 feet)
 
 # =============================================================================
 # Phase 4 - VLA (Vision-Language-Action) Integration
@@ -127,11 +154,11 @@ VLM_SITUATION_INTERVAL_S = 2.5      # seconds between situation queries
 VLM_SITUATION_TIMEOUT_S  = 8.0      # discard stale mode after this
 
 BEHAVIOR_MODES = {
-    "ACTIVE":  {"speed": 98, "arrival_ratio": 0.40, "bark_enabled": True,  "bark_volume": 80, "idle_pose": "stand"},
-    "GENTLE":  {"speed": 60, "arrival_ratio": 0.30, "bark_enabled": True,  "bark_volume": 40, "idle_pose": "sit"},
-    "CALM":    {"speed": 50, "arrival_ratio": 0.25, "bark_enabled": False, "bark_volume": 0,  "idle_pose": "lie"},
-    "PLAYFUL": {"speed": 98, "arrival_ratio": 0.45, "bark_enabled": True,  "bark_volume": 80, "idle_pose": "stand"},
-    "SOCIAL":  {"speed": 70, "arrival_ratio": 0.35, "bark_enabled": False, "bark_volume": 0,  "idle_pose": "stand"},
+    "ACTIVE":  {"speed": 98, "arrival_ratio": 0.55, "bark_enabled": True,  "bark_volume": 80, "idle_pose": "stand"},
+    "GENTLE":  {"speed": 60, "arrival_ratio": 0.45, "bark_enabled": True,  "bark_volume": 40, "idle_pose": "sit"},
+    "CALM":    {"speed": 50, "arrival_ratio": 0.40, "bark_enabled": False, "bark_volume": 0,  "idle_pose": "lie"},
+    "PLAYFUL": {"speed": 98, "arrival_ratio": 0.60, "bark_enabled": True,  "bark_volume": 80, "idle_pose": "stand"},
+    "SOCIAL":  {"speed": 70, "arrival_ratio": 0.50, "bark_enabled": False, "bark_volume": 0,  "idle_pose": "stand"},
 }
 
 BEHAVIOR_DEFAULT_MODE = "ACTIVE"

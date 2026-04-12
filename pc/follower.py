@@ -115,6 +115,14 @@ class TelemetryReceiver:
         with self.lock:
             return self.data.get("distance_cm", -1)
 
+    def get_scan_state(self):
+        with self.lock:
+            return self.data.get("scan_state", "idle")
+
+    def get_scan_result(self):
+        with self.lock:
+            return self.data.get("scan_result", None)
+
     def stop(self):
         self.running = False
         self.sock.close()
@@ -123,10 +131,11 @@ class TelemetryReceiver:
 class Follower:
     def __init__(self):
         self.state = State.IDLE
-        self.last_owner_seen = 0.0
+        self.last_owner_seen = time.time()  # start the IDLE→EXPLORE countdown from boot
         self.search_start_time = 0.0
         self._unconfirmed_count = 0
         self._should_bark = False
+        self._investigating = False  # True when approaching unconfirmed person
         self._last_cmd_time = 0.0
         self._cmd_interval = config.CMD_INTERVAL
         self._smoothed_head_yaw = 0.0
@@ -147,6 +156,20 @@ class Follower:
         self._pending_mode_count = 0    # consecutive readings of pending mode
         self._situation_seq_seen = 0
 
+        # Body centering — tracks last follow action to prevent rapid
+        # forward↔turn oscillation at threshold boundaries.
+        self._last_follow_action = "forward"
+        self._last_follow_action_time = 0.0
+
+        # Obstacle avoidance — LiDAR arc-based (Phase 7) or VLM fallback
+        self._scan_phase = None             # None / "backing" / "turning" / "clearing"
+        self._scan_phase_until = 0.0
+        self._scan_phase_cmd = None
+        self._scan_result_direction = None  # LEFT / RIGHT
+        self._lidar = None                  # set in main block if LiDAR available
+        self._latest_nav_frame = None       # latest ribbon cam frame for VLM
+        self._latest_nav_frame_time = 0.0   # timestamp for staleness check
+
         # Phase 6B: Semantic exploration
         self._explore_direction = None
         self._explore_direction_time = 0.0
@@ -166,6 +189,20 @@ class Follower:
 
     def update(self, perception_result):
         now = time.time()
+
+        # ── Obstacle maneuver override ────────────────────────────
+        # If a backup/turn/clearing maneuver is in progress, it takes
+        # priority over ALL state logic. Without this, losing the owner
+        # mid-backup causes the coast path to send forward at speed=98,
+        # overriding the backup and slamming into the obstacle.
+        if self._scan_phase is not None:
+            cmd = self._handle_maneuver(now)
+            if cmd is not None:
+                if now - self._last_cmd_time >= self._cmd_interval:
+                    self.send_command(cmd)
+                    self._last_cmd_time = now
+                return cmd
+
         owner = self._find_owner(perception_result)
 
         # "Identity bark" — person detected for 10+ frames but no face match
@@ -214,26 +251,87 @@ class Follower:
             cmd = self._explore(now, perception_result)
 
         else:
-            self._transition(State.IDLE)
-            cmd = Command("stop", head_mode="remote", head_yaw=0.0)
+            # If IDLE for > 5 seconds with no one visible, start exploring.
+            # Without this, the dog sits frozen forever when no person is
+            # in frame at startup. A real dog would wander to find its owner.
+            if self.state == State.IDLE and now - self.last_owner_seen > 5.0:
+                self._transition(State.EXPLORE)
+                cmd = self._explore(now, perception_result)
+            elif self.state == State.EXPLORE:
+                # Already exploring from IDLE — keep going
+                cmd = self._explore(now, perception_result)
+            else:
+                self._transition(State.IDLE)
+                cmd = Command("stop", head_mode="remote", head_yaw=0.0)
 
         if now - self._last_cmd_time >= self._cmd_interval:
             self.send_command(cmd)
             self._last_cmd_time = now
         return cmd
 
+    def _handle_maneuver(self, now):
+        """
+        Handle obstacle turn hold. With LiDAR, this is just a timed turn —
+        no backup, no clearing, no multi-phase state machine. The LiDAR
+        re-checks every frame after the hold expires, so if the obstacle
+        is still there, it triggers another turn.
+
+        Called from update() before any state logic. Returns a Command if
+        a turn hold is active, or None to fall through to normal logic.
+        """
+        if self._scan_phase == "turning":
+            if now > self._scan_phase_until:
+                # Turn hold expired — resume normal behavior.
+                # LiDAR will re-check on the next frame and trigger
+                # another turn if the obstacle is still in the forward arc.
+                print("[Follower] Obstacle turn complete — resuming")
+                self._scan_phase = None
+                self._scan_phase_cmd = None
+                self._scan_result_direction = None
+                return None
+            return self._scan_phase_cmd  # keep turning
+
+        return None
+
     def _find_owner(self, result):
         if not hasattr(result, 'detections') or not result.detections:
             return None
+
+        # Priority 1: confirmed owner face match
         if hasattr(result, 'face_matches') and result.face_matches:
             for i, match in enumerate(result.face_matches):
                 if match.is_owner and i < len(result.detections):
                     self._unconfirmed_count = 0
+                    self._investigating = False
                     return result.detections[i]
-        if len(result.detections) > 0 and self.state == State.FOLLOW:
+
+        # Priority 2: approach unconfirmed person to investigate
+        # Only chase high-confidence YOLO detections (>0.7) to avoid
+        # following furniture/cabinets that YOLO misclassifies as people.
+        # Never bark during investigation — only bark if we were already
+        # confirmed following the owner and lost the face match.
+        high_conf = [d for d in result.detections if d.confidence > 0.7]
+        if high_conf:
+            if self.state in (State.IDLE, State.SEARCH, State.EXPLORE):
+                largest = max(high_conf, key=lambda d: d.area)
+                self._investigating = True
+                return largest
+            elif self.state == State.FOLLOW:
+                # Keep following largest detection (likely same person, bad angle)
+                self._unconfirmed_count += 1
+                largest = max(high_conf, key=lambda d: d.area)
+                return largest
+
+        # Low-confidence detections in FOLLOW — might be losing the person.
+        # Don't bark at furniture. Only bark if we WERE following a confirmed
+        # owner (investigating=False) and lost them at close range.
+        if result.detections and self.state == State.FOLLOW and not self._investigating:
             self._unconfirmed_count += 1
-            if self._unconfirmed_count > 10:
+            if self._unconfirmed_count > 50:
                 self._should_bark = True
+            largest = max(result.detections, key=lambda d: d.area)
+            return largest
+
         return None
 
     def _consume_situation(self, result):
@@ -332,20 +430,48 @@ class Follower:
         bp = self._behavior_params   # current behavior mode params
 
         # ═══ Safety hierarchy for body movement ═══════════════════
-        #   1. Ultrasonic stop   — hard safety, always wins
+        #   1. LiDAR obstacle    — arc-based, instant, no VLM needed
         #   2. Bark hold         — sustain greeting while head is up
         #   3. Arrival bark      — close enough (bbox area), celebrate
         #   4. Body centering    — turn toward owner if off-center
         #   5. Default forward   — cruise toward owner
 
-        # Priority 1: Ultrasonic obstacle — redirect turn toward owner.
-        if 0 < distance < config.ULTRASONIC_STOP_CM:
-            if offset_x < -30:
-                return Command("turn_left", speed=90, step_count=3,
-                               head_mode="local", owner_bbox=owner_bbox)
-            else:
-                return Command("turn_right", speed=90, step_count=3,
-                               head_mode="local", owner_bbox=owner_bbox)
+        # Priority 1: LiDAR obstacle avoidance (Phase 7).
+        # Check forward arc every frame — if blocked, immediately pick
+        # the clearer side and turn. No VLM call, no 3-phase maneuver,
+        # no backup. Just check arcs and steer away.
+        # Falls back to ultrasonic if LiDAR unavailable.
+        obstacle_cm = getattr(config, "LIDAR_OBSTACLE_CM", 35)
+        if self._lidar is not None and self._lidar.has_data():
+            fwd_dist = self._lidar.get_forward_distance()
+            if fwd_dist < obstacle_cm and self._scan_phase is None:
+                left_dist = self._lidar.get_left_distance()
+                right_dist = self._lidar.get_right_distance()
+                if left_dist > right_dist:
+                    turn_dir = "turn_left"
+                else:
+                    turn_dir = "turn_right"
+                turn_steps = getattr(config, "LIDAR_TURN_STEP_COUNT", 12)
+                turn_hold = getattr(config, "LIDAR_TURN_HOLD_S", 2.0)
+                print(f"[Follower] LIDAR OBSTACLE fwd={fwd_dist:.0f}cm "
+                      f"L={left_dist:.0f}cm R={right_dist:.0f}cm → {turn_dir}")
+                self._scan_phase = "turning"
+                self._scan_phase_until = now + turn_hold
+                self._scan_phase_cmd = Command(
+                    turn_dir, speed=90, step_count=turn_steps,
+                    head_mode="local", owner_bbox=owner_bbox)
+                self._scan_result_direction = turn_dir
+                return self._scan_phase_cmd
+        elif 0 < distance < config.ULTRASONIC_STOP_CM and self._scan_phase is None:
+            # Ultrasonic fallback (no LiDAR) — simple turn left
+            print(f"[Follower] ULTRASONIC OBSTACLE {distance:.0f}cm — turning left (no LiDAR)")
+            self._scan_phase = "turning"
+            self._scan_phase_until = now + 2.0
+            self._scan_phase_cmd = Command(
+                "turn_left", speed=90, step_count=12,
+                head_mode="remote", head_yaw=0,
+                head_pitch=config.HEAD_DEFAULT_PITCH)
+            return self._scan_phase_cmd
 
         # Priority 2: Active bark hold — sustain greeting.
         if self._bark_hold_until > now:
@@ -383,18 +509,55 @@ class Follower:
 
         # Dynamic speed from behavior mode (ACTIVE=98, GENTLE=60, etc.)
         speed = bp["speed"]
-        step_count = 2
 
-        # Priority 4: Body centering — turn toward owner.
-        if offset_x < -config.BODY_TURN_THRESHOLD:
-            return Command("turn_left", speed=speed, step_count=step_count,
-                           head_mode="local", owner_bbox=owner_bbox)
-        if offset_x > config.BODY_TURN_THRESHOLD:
-            return Command("turn_right", speed=speed, step_count=step_count,
+        # Priority 4: Body centering — distance-adaptive dead zone.
+        # Far away: wide dead zone (200px) → go mostly straight, avoid obstacles.
+        # Close up: tight dead zone (60px) → fine centering for arrival.
+        if area_ratio < 0.08:
+            turn_threshold = 220   # very far — almost never turn, just go straight
+        elif area_ratio < 0.15:
+            turn_threshold = 160   # far — gentle corrections only
+        elif area_ratio < 0.30:
+            turn_threshold = 100   # medium — moderate steering
+        else:
+            turn_threshold = 60    # close — tight centering for arrival
+
+        # Hysteresis: once turning, keep turning until well-centered.
+        TURN_HYSTERESIS = 30
+        if self._last_follow_action in ("turn_left", "turn_right"):
+            effective_threshold = max(turn_threshold - TURN_HYSTERESIS, 30)
+        else:
+            effective_threshold = turn_threshold
+
+        # Decide wanted action
+        if offset_x < -effective_threshold:
+            wanted_action = "turn_left"
+        elif offset_x > effective_threshold:
+            wanted_action = "turn_right"
+        else:
+            wanted_action = "forward"
+
+        # Minimum hold: commit to an action for at least 1 second before
+        # switching. Each forward↔turn switch causes a servo snap because
+        # the gait start positions are very different. Longer holds mean
+        # fewer transitions and smoother movement.
+        if wanted_action != self._last_follow_action:
+            if now - self._last_follow_action_time >= 1.0:
+                self._last_follow_action = wanted_action
+                self._last_follow_action_time = now
+            else:
+                wanted_action = self._last_follow_action
+
+        # Higher step_count so each gait runs longer between re-evaluations.
+        # step_count=4 for turns (~1s), step_count=6 for forward (~1.5s).
+        turn_steps = getattr(config, "BODY_TURN_STEP_COUNT", 4)
+        fwd_steps = getattr(config, "FORWARD_STEP_COUNT", 8)
+        if wanted_action in ("turn_left", "turn_right"):
+            return Command(wanted_action, speed=speed, step_count=turn_steps,
                            head_mode="local", owner_bbox=owner_bbox)
 
         # Priority 5: Default — forward toward owner.
-        return Command("forward", speed=speed, step_count=step_count,
+        return Command("forward", speed=speed, step_count=fwd_steps,
                        head_mode="local", owner_bbox=owner_bbox)
 
     def _search(self, now):
@@ -421,11 +584,44 @@ class Follower:
         """
         self._consume_explore(result)
 
-        # If currently executing a VLM-directed move, keep going
+        pitch = getattr(config, "EXPLORE_HEAD_PITCH", -10)
+
+        # ── LiDAR obstacle check (or ultrasonic fallback) ──────────────
+        obstacle_cm = getattr(config, "LIDAR_OBSTACLE_CM", 35)
+        if self._lidar is not None and self._lidar.has_data():
+            fwd_dist = self._lidar.get_forward_distance()
+            if fwd_dist < obstacle_cm and self._scan_phase is None:
+                left_dist = self._lidar.get_left_distance()
+                right_dist = self._lidar.get_right_distance()
+                turn_dir = "turn_left" if left_dist > right_dist else "turn_right"
+                turn_steps = getattr(config, "LIDAR_TURN_STEP_COUNT", 12)
+                turn_hold = getattr(config, "LIDAR_TURN_HOLD_S", 2.0)
+                print(f"[Follower] EXPLORE LIDAR fwd={fwd_dist:.0f}cm "
+                      f"L={left_dist:.0f}cm R={right_dist:.0f}cm → {turn_dir}")
+                self._explore_direction = None
+                self._explore_move_until = 0.0
+                self._scan_phase = "turning"
+                self._scan_phase_until = now + turn_hold
+                self._scan_phase_cmd = Command(
+                    turn_dir, speed=90, step_count=turn_steps,
+                    head_mode="remote", head_yaw=0, head_pitch=pitch)
+                return self._scan_phase_cmd
+        else:
+            distance = self.telemetry.get_distance()
+            if 0 < distance < config.ULTRASONIC_STOP_CM and self._scan_phase is None:
+                print(f"[Follower] EXPLORE ULTRASONIC {distance:.0f}cm — turning left (no LiDAR)")
+                self._explore_direction = None
+                self._explore_move_until = 0.0
+                self._scan_phase = "turning"
+                self._scan_phase_until = now + 2.0
+                self._scan_phase_cmd = Command(
+                    "turn_left", speed=90, step_count=12,
+                    head_mode="remote", head_yaw=0, head_pitch=pitch)
+                return self._scan_phase_cmd
+
+        # ── Hold check — if we're mid-turn or mid-move, finish it ────
         if self._explore_move_until > now:
             return self._last_explore_cmd
-
-        pitch = getattr(config, "EXPLORE_HEAD_PITCH", -10)
 
         # Check if VLM gave us a direction
         if self._explore_direction is not None:
@@ -486,6 +682,12 @@ class Follower:
         self.cmd_sock.send(cmd.to_json())
 
     def close(self):
+        # Send stop so the Pi doesn't keep executing the last action
+        try:
+            self.send_command(Command("stop"))
+            time.sleep(0.15)  # give ZMQ time to deliver before socket closes
+        except Exception:
+            pass
         self.telemetry.stop()
         self.cmd_sock.close()
         self.ctx.term()
@@ -526,9 +728,26 @@ if __name__ == "__main__":
     follower = Follower()
     follower.pipeline = pipeline  # Phase 6: follower switches VLM query type
 
+    # Phase 7: LiDAR obstacle avoidance (optional — falls back to ultrasonic)
+    if getattr(config, "USE_LIDAR", False):
+        try:
+            from lidar_map import LidarMap
+            lidar = LidarMap(ctx)
+            lidar.start()
+            follower._lidar = lidar
+            print("[Main] LiDAR obstacle avoidance enabled")
+        except ImportError:
+            print("[Main] LiDAR module not found — using ultrasonic fallback")
+        except Exception as e:
+            print(f"[Main] LiDAR init failed: {e} — using ultrasonic fallback")
+
     window = "IronBark Follow-Me"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window, 640, 480)
+
+    nav_window = "IronBark Ribbon Cam"
+    cv2.namedWindow(nav_window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(nav_window, 640, 480)
 
     def get_latest_frame(socket):
         msg = None
@@ -579,6 +798,8 @@ if __name__ == "__main__":
                     decoded = decode_frame(nav_raw)
                     if decoded is not None:
                         latest_nav_frame = decoded
+                        follower._latest_nav_frame = decoded
+                        follower._latest_nav_frame_time = time.time()
 
             result = pipeline.process_frame(frame, nav_frame=latest_nav_frame)
             cmd = follower.update(result)
@@ -620,6 +841,49 @@ if __name__ == "__main__":
             if ar_text:
                 cv2.putText(display, ar_text, (450, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ar_color, 1)
             cv2.imshow(window, display)
+
+            # Show ribbon cam in second window with action debug info
+            if latest_nav_frame is not None:
+                nav_display = latest_nav_frame.copy()
+                cv2.putText(nav_display, "Ribbon Cam (obstacle detection)",
+                            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 200), 1)
+
+                # Ribbon window shows what the VLM/perception wants
+                # vs what the follower is actually sending to the Pi
+                cur_action = cmd.action.upper().replace("_", " ")
+                vlm_action = follower._last_follow_action.upper().replace("_", " ")
+                state_name = follower.state.value
+
+                # Color code current action
+                action_colors = {
+                    "FORWARD": (0, 255, 0),       # green
+                    "TURN LEFT": (255, 200, 0),    # cyan
+                    "TURN RIGHT": (0, 200, 255),   # orange
+                    "BACKWARD": (0, 0, 255),       # red
+                    "STOP": (150, 150, 150),       # gray
+                    "OBSTACLE SCAN": (0, 255, 255), # yellow
+                }
+                cur_color = action_colors.get(cur_action, (255, 255, 255))
+
+                cv2.putText(nav_display, f"VLM wants:    {vlm_action}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
+                cv2.putText(nav_display, f"Actual cmd:   {cur_action}",
+                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.65, cur_color, 2)
+                cv2.putText(nav_display, f"State: {state_name}",
+                            (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+
+                # Scan phase if active
+                if follower._scan_phase is not None:
+                    scan_dir = follower._scan_result_direction or "?"
+                    cv2.putText(nav_display, f"Maneuver: {follower._scan_phase} -> {scan_dir}",
+                                (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 100, 255), 2)
+
+                # Distance bar at bottom
+                cv2.putText(nav_display, f"Dist: {dist:.0f}cm" if dist > 0 else "Dist: N/A",
+                            (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, dist_color, 1)
+
+                cv2.imshow(nav_window, nav_display)
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     except KeyboardInterrupt:
