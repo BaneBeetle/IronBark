@@ -106,21 +106,30 @@ ssh <pi-user>@<pi-ip> 'ls ~/ironbark/'
 
 You should see: `config.py`, `.env`, `pi_sender.py`, `motor_controller.py`, `remote_control.py`.
 
-## Step 5: Enroll Your Face
+## Step 5: Enroll Your Face (Multi-Distance)
 
-The dog needs to know what you look like. Run the enrollment tool on the Mac:
+The dog needs to know what you look like from different distances. Enrollment captures your face at 3 distances from the ground-level camera so recognition works at operating range (not just close-up).
+
+**Run enrollment each session** — future body ReID will also capture clothing appearance, which changes day to day.
+
+Start the Pi webcam stream first (see Step 6, Terminal 2), then on the Mac:
 
 ```bash
 cd ~/Projects/ironbark
 .venv/bin/python pc/enroll_owner.py
 ```
 
-1. Stand ~3 feet from the webcam (temporarily plugged into Mac via USB, or use the Pi stream).
-2. Press **SPACE** to start capture.
-3. Slowly turn your head left and right over 8 seconds.
-4. The tool captures 25 face samples and saves a 512-dim embedding to `data/owner_embedding.npy`.
+1. Place the camera at its mounted position (on the dog's head, ~6 inches off the ground).
+2. Press **SPACE**. The tool shows: **"Stage 1/3: Move to CLOSE (2 ft)"**.
+3. Stand ~2 ft from the camera. Press **SPACE** to begin capture.
+4. **Turn your head only** left and right (body stays facing camera). 10 samples are captured automatically.
+5. The tool advances: **"Stage 2/3: Move to MEDIUM (4 ft)"**. Step back and press **SPACE**.
+6. Again, turn your head only left and right. 10 samples captured.
+7. The tool advances: **"Stage 3/3: Move to FAR (6-8 ft)"**. Step back and press **SPACE**.
+8. At this distance, **slight body turns (~15 deg)** are fine in addition to head turns.
+9. After all 30 samples, the gallery is saved to `data/owner_gallery.npy`.
 
-> **Tip:** Good enrollment means varied head angles. Don't just stare at the camera — the system averages across poses to create a robust embedding.
+> **Why multi-distance?** The camera is at ground level looking up. A face captured at 2 ft looks very different from one at 6 ft (angle, resolution, scale). Storing all embeddings as a gallery — rather than averaging into one — means the system finds the best match regardless of your current distance.
 
 ## Step 6: Start the System
 

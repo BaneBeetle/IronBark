@@ -17,14 +17,28 @@ sys.path.insert(0, str(Path(__file__).parent))
 from perception import YOLODetector, PersonDetection
 from perception import VLMReasoner, VLMResponse, SituationResponse, ExploreResponse
 from perception import FaceRecognizer, FaceMatch
+from perception import ReIDRecognizer
 
 import config as _cfg
 
 
 @dataclass
+class OwnerMatch:
+    """Fused face + body recognition result for one person detection."""
+    is_owner:       bool
+    confidence:     float          # fused score (0.0-1.0)
+    face_score:     float = 0.0   # raw ArcFace gallery score
+    body_score:     float = 0.0   # raw OSNet body ReID score
+    face_weight:    float = 0.0   # how much face contributed to fusion
+    body_weight:    float = 0.0   # how much body contributed to fusion
+    face_px:        int   = 0     # face bbox size (px), 0 = no face detected
+
+
+@dataclass
 class PerceptionResult:
     detections:         List[PersonDetection]
-    face_matches:       List[FaceMatch]
+    face_matches:       List[FaceMatch]           # raw face-only results (kept for compat)
+    owner_matches:      List[OwnerMatch] = field(default_factory=list)  # fused face+body
     vlm_response:       Optional[VLMResponse] = None       # legacy, kept for compat
     vlm_seq:            int = 0                             # legacy
     situation_response: Optional[SituationResponse] = None
@@ -52,8 +66,18 @@ class PerceptionPipeline:
 
         self.face_recognizer = FaceRecognizer(
             embedding_path=cfg.get("OWNER_EMBEDDING_PATH", "data/owner_embedding.npy"),
+            gallery_path=cfg.get("OWNER_GALLERY_PATH", "data/owner_gallery.npy"),
             threshold=cfg.get("FACE_THRESHOLD", 0.6),
         )
+
+        self.reid = ReIDRecognizer(
+            gallery_path=cfg.get("OWNER_BODY_GALLERY_PATH", "data/owner_body_gallery.npy"),
+            threshold=cfg.get("REID_THRESHOLD", 0.40),
+        )
+
+        # Distance-adaptive fusion thresholds (face bbox size in pixels)
+        self._face_full_px = cfg.get("REID_FACE_FULL_PX", 80)
+        self._face_none_px = cfg.get("REID_FACE_NONE_PX", 40)
 
         self.vlm = VLMReasoner(
             model=cfg.get("VLM_MODEL", "llava:7b"),
@@ -78,8 +102,16 @@ class PerceptionPipeline:
         self._latest_explore: Optional[ExploreResponse] = None
         self._explore_seq = 0
 
-        # Face recognition temporal smoothing — IoU-tracked rolling buffers
-        self._face_tracks: List[Dict[str, Any]] = []
+        # Face recognition temporal smoothing — keyed by ByteTrack ID
+        self._face_tracks: Dict[int, deque] = {}
+
+        # ── ByteTrack owner persistence ──────────────────────
+        # Once a track ID is confirmed owner, it stays owner for up to
+        # HOLDOVER_FRAMES frames even if recognition momentarily fails.
+        # This prevents the dog from entering SEARCH on a single bad frame.
+        self._owner_track_id: int = -1          # current owner's ByteTrack ID
+        self._owner_track_age: int = 0          # frames since last positive recognition
+        self._owner_holdover: int = 15          # keep owner label for this many frames
 
         print("[PerceptionPipeline] All components initialized.")
 
@@ -137,55 +169,91 @@ class PerceptionPipeline:
             except Exception as e:
                 print(f"[VLM-Worker] Error: {e}")
 
-    @staticmethod
-    def _bbox_iou(a, b) -> float:
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
-        ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
-        iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
-        inter = iw * ih
-        union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
-        return inter / union if union > 0 else 0.0
+    def _fuse_scores(self, face_match: FaceMatch, body_score: float) -> 'OwnerMatch':
+        """
+        Distance-adaptive face+body fusion.
+
+        Weights are a function of face bbox size (px):
+          - face >= REID_FACE_FULL_PX (80): face_w=0.8, body_w=0.2
+          - face <= REID_FACE_NONE_PX (40): face_w=0.0, body_w=1.0
+          - between: linear interpolation
+          - no face detected at all:        face_w=0.0, body_w=1.0
+
+        This ensures ArcFace dominates when it's reliable (close range,
+        big face) and body ReID takes over when face is too small or absent.
+        """
+        face_score = face_match.confidence
+        face_detected = face_match.embedding is not None
+
+        if not face_detected:
+            # No face at all — body only
+            face_px = 0
+            face_w, body_w = 0.0, 1.0
+        else:
+            # Estimate face size from the embedding (we don't store bbox,
+            # but we can infer from confidence — high confidence = big face).
+            # For now, use a heuristic: if face_score > threshold, treat as
+            # "good enough" face. The real face_px would come from insightface
+            # bbox, which we'll thread through in a future pass.
+            # Approximate: map confidence to a proxy face size.
+            # A face with score >= 0.45 at close range is ~80px+.
+            # A face with score ~0.30 at medium range is ~40-60px.
+            if face_score >= self.face_recognizer.threshold:
+                face_px = self._face_full_px  # treat high-confidence as close
+            else:
+                face_px = self._face_none_px  # treat low-confidence as far
+
+            # Compute adaptive weights
+            t = max(0.0, min(1.0,
+                (face_px - self._face_none_px) /
+                max(1, self._face_full_px - self._face_none_px)
+            ))
+            face_w = 0.8 * t          # 0.0 at far, 0.8 at close
+            body_w = 1.0 - face_w     # 1.0 at far, 0.2 at close
+
+        fused = face_w * face_score + body_w * body_score
+        fused_threshold = (face_w * self.face_recognizer.threshold +
+                           body_w * self.reid.threshold)
+
+        return OwnerMatch(
+            is_owner=fused >= fused_threshold,
+            confidence=float(fused),
+            face_score=float(face_score),
+            body_score=float(body_score),
+            face_weight=float(face_w),
+            body_weight=float(body_w),
+            face_px=face_px,
+        )
 
     def _smooth_face_matches(self, detections, raw_matches):
         """
         Apply temporal smoothing to per-detection face matches.
-        Associates detections across frames via IoU and maintains a rolling
-        confidence window per track. Only frames where a face was actually
-        detected (embedding is not None) update the buffer — this prevents
-        single missed-face frames from polluting the smoothed result.
+        Uses ByteTrack track IDs (instead of hand-rolled IoU) to associate
+        detections across frames. Maintains a rolling confidence window per
+        track. Only frames where a face was actually detected (embedding is
+        not None) update the buffer.
         """
-        window     = getattr(_cfg, "FACE_SMOOTH_WINDOW", 5)
-        iou_thresh = getattr(_cfg, "FACE_TRACK_IOU", 0.3)
-        threshold  = self.face_recognizer.threshold
+        window    = getattr(_cfg, "FACE_SMOOTH_WINDOW", 5)
+        threshold = self.face_recognizer.threshold
 
-        new_tracks = []
         smoothed = []
-        used_idxs = set()
+        active_ids = set()
 
         for det, fm in zip(detections, raw_matches):
-            # Find best matching previous track by IoU (greedy 1-to-1)
-            best_idx, best_iou = -1, 0.0
-            for i, track in enumerate(self._face_tracks):
-                if i in used_idxs:
-                    continue
-                iou = self._bbox_iou(det.bbox, track["bbox"])
-                if iou > best_iou and iou >= iou_thresh:
-                    best_iou = iou
-                    best_idx = i
+            tid = det.track_id
 
-            if best_idx >= 0:
-                history = self._face_tracks[best_idx]["history"]
-                used_idxs.add(best_idx)
+            if tid >= 0 and tid in self._face_tracks:
+                history = self._face_tracks[tid]
             else:
                 history = deque(maxlen=window)
 
-            # Only feed the buffer when a face was actually matched this frame
+            # Only feed the buffer when a face was actually matched
             if fm.embedding is not None:
                 history.append(fm.confidence)
 
-            new_tracks.append({"bbox": det.bbox, "history": history})
+            if tid >= 0:
+                self._face_tracks[tid] = history
+                active_ids.add(tid)
 
             if len(history) > 0:
                 mean_conf = sum(history) / len(history)
@@ -195,10 +263,13 @@ class PerceptionPipeline:
                     embedding=fm.embedding,
                 ))
             else:
-                # Brand-new track with no face yet — pass raw match through
                 smoothed.append(fm)
 
-        self._face_tracks = new_tracks
+        # Prune stale tracks (IDs not seen this frame)
+        stale = [k for k in self._face_tracks if k not in active_ids]
+        for k in stale:
+            del self._face_tracks[k]
+
         return smoothed
 
     def process_frame(self, frame: np.ndarray,
@@ -234,9 +305,8 @@ class PerceptionPipeline:
                     margin_x, margin_y = int(pw * 0.1), int(ph * 0.1)
                     if (x1 - margin_x <= face_cx <= x2 + margin_x and
                         y1 - margin_y <= face_cy <= y2 + margin_y):
-                        if self.face_recognizer.owner_embedding is not None:
-                            similarity = self.face_recognizer._cosine_similarity(
-                                face.embedding, self.face_recognizer.owner_embedding)
+                        if self.face_recognizer.owner_gallery is not None:
+                            similarity = self.face_recognizer.match_gallery(face.embedding)
                             if similarity > best_similarity:
                                 best_similarity = similarity
                                 best_match = FaceMatch(
@@ -251,7 +321,60 @@ class PerceptionPipeline:
         if detections:
             face_matches = self._smooth_face_matches(detections, face_matches)
         else:
-            self._face_tracks = []
+            self._face_tracks.clear()
+
+        # ── Face + body fusion ────────────────────────────────
+        # Run body ReID on every detection and fuse with face scores.
+        # Weights are distance-adaptive: face dominates when the face is
+        # large (close range), body dominates when face is small/absent.
+        owner_matches = []
+        h_frame, w_frame = frame.shape[:2]
+        for det, fm in zip(detections, face_matches):
+            x1, y1, x2, y2 = det.bbox
+            # Body ReID — always runs (works from behind, at any distance)
+            body_crop = frame[max(0,y1):min(h_frame,y2), max(0,x1):min(w_frame,x2)]
+            body_score = self.reid.recognize(body_crop)
+
+            owner_matches.append(self._fuse_scores(fm, body_score))
+
+        # ── ByteTrack owner persistence ──────────────────────
+        # If a detection was confirmed owner this frame, lock its track ID.
+        # If the owner track ID appears but recognition dipped, hold the
+        # label for up to _owner_holdover frames before giving up.
+        owner_found_this_frame = False
+        for det, om in zip(detections, owner_matches):
+            if om.is_owner and det.track_id >= 0:
+                self._owner_track_id = det.track_id
+                self._owner_track_age = 0
+                owner_found_this_frame = True
+                break
+
+        if not owner_found_this_frame and self._owner_track_id >= 0:
+            self._owner_track_age += 1
+            if self._owner_track_age <= self._owner_holdover:
+                # Try to find the cached owner track ID in this frame's
+                # detections — if present, promote it to owner even though
+                # recognition didn't fire this frame.
+                for i, det in enumerate(detections):
+                    if det.track_id == self._owner_track_id:
+                        om = owner_matches[i]
+                        if not om.is_owner:
+                            owner_matches[i] = OwnerMatch(
+                                is_owner=True,
+                                confidence=om.confidence,
+                                face_score=om.face_score,
+                                body_score=om.body_score,
+                                face_weight=om.face_weight,
+                                body_weight=om.body_weight,
+                                face_px=om.face_px,
+                            )
+                        owner_found_this_frame = True
+                        break
+
+            if self._owner_track_age > self._owner_holdover:
+                # Track expired — release the lock
+                self._owner_track_id = -1
+                self._owner_track_age = 0
 
         # Phase 6: Route VLM queries based on current mode.
         # Every queue item is (frame, query_type, detection_count).
@@ -286,6 +409,7 @@ class PerceptionPipeline:
         latency_ms = (time.perf_counter() - t_start) * 1000.0
         return PerceptionResult(
             detections=detections, face_matches=face_matches,
+            owner_matches=owner_matches,
             situation_response=situation_response, situation_seq=situation_seq,
             explore_response=explore_response, explore_seq=explore_seq,
             frame_id=self._frame_id, latency_ms=latency_ms)
@@ -294,19 +418,31 @@ class PerceptionPipeline:
         display = frame.copy()
         h, w = display.shape[:2]
 
-        for detection, face_match in zip(result.detections, result.face_matches):
+        enrolled = (self.face_recognizer.owner_gallery is not None or
+                    self.reid.owner_gallery is not None)
+
+        for i, detection in enumerate(result.detections):
             x1, y1, x2, y2 = detection.bbox
-            if self.face_recognizer.owner_embedding is None:
-                color, label = (0, 255, 255), f"Person {detection.confidence:.0%}"
-            elif face_match.is_owner:
-                color, label = (0, 200, 0), f"OWNER {face_match.confidence:.0%}"
+
+            tid = detection.track_id
+            tid_str = f"#{tid}" if tid >= 0 else ""
+
+            if not enrolled:
+                color, label = (0, 255, 255), f"Person{tid_str} {detection.confidence:.0%}"
+            elif i < len(result.owner_matches):
+                om = result.owner_matches[i]
+                if om.is_owner:
+                    detail = f"F:{om.face_score:.0%} B:{om.body_score:.0%}"
+                    color, label = (0, 200, 0), f"OWNER{tid_str} {om.confidence:.0%} ({detail})"
+                else:
+                    color, label = (0, 0, 220), f"Stranger{tid_str} {om.confidence:.0%}"
             else:
-                color, label = (0, 0, 220), f"Stranger {face_match.confidence:.0%}"
+                color, label = (0, 255, 255), f"Person{tid_str}"
 
             cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
             cv2.rectangle(display, (x1, y1 - label_size[1] - 8), (x1 + label_size[0] + 4, y1), color, -1)
-            cv2.putText(display, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(display, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
         # Phase 6: Show behavior mode or explore direction
         if result.situation_response:

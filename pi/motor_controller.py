@@ -429,11 +429,22 @@ class MotorController:
         cleanup_orphaned_pidog()
 
         # ── PiDog init ──────────────────────────────────────────────
+        # Two-stage standup: halfway first, pause, then full stand.
+        # Prevents jerking upright with the LiDAR weight up top.
         print("[Motor] Initializing PiDog...")
         self.dog = Pidog()
-        self.dog.do_action("stand", speed=80)
-        self.dog.wait_all_done()
+        # Stage 1: halfway up (crouch) — slow and controlled
+        halfway = Pidog.legs_angle_calculation(
+            [[10, 60], [10, 60], [25, 55], [25, 55]]
+        )
+        self.dog.legs_move([halfway], speed=50)
+        self.dog.wait_legs_done()
         time.sleep(0.5)
+        # Stage 2: full stand
+        self.dog.do_action("stand", speed=60)
+        self.dog.wait_all_done()
+        time.sleep(0.3)
+        print("[Motor] Standup complete (2-stage)")
 
         # ── Generate sharp pivot turn gaits ───────────────────────
         rotate_left, rotate_right = self._generate_sharp_turns()
@@ -496,6 +507,7 @@ class MotorController:
         self.running = True
         self.last_telem_time = 0.0
         self.gait_done_time = 0.0   # tracks when last gait finished
+        self._ramped_speed = 0      # current ramped speed (ramps toward target)
 
         self.dog.rgb_strip.set_mode("breath", "blue", bps=0.5)
         print("[Motor] Ready. Waiting for commands...")
@@ -673,6 +685,21 @@ class MotorController:
                  bark_volume=80, idle_pose=None, thinking=False):
         """Execute action via PiDog SDK. Respects speed/step_count from sender."""
 
+        # ── Speed ramping: don't jump from 0→98 instantly ─────────
+        # Ramp up/down by 20 per cycle. At 20Hz loop, 0→98 takes ~5 cycles
+        # (~250ms). Prevents explosive starts and smoother stops.
+        if action in self.ACTION_MAP and action == self.current_action:
+            ramp_step = 20
+            if self._ramped_speed < speed:
+                self._ramped_speed = min(speed, self._ramped_speed + ramp_step)
+            elif self._ramped_speed > speed:
+                self._ramped_speed = max(speed, self._ramped_speed - ramp_step)
+            speed = self._ramped_speed
+        elif action in self.ACTION_MAP:
+            # New action — start ramping from low
+            self._ramped_speed = min(40, speed)  # start at 40 or target if lower
+            speed = self._ramped_speed
+
         # Phase 6B: "Thinking" animation — dog is waiting for VLM explore
         if thinking:
             if self.current_action != "thinking":
@@ -773,36 +800,40 @@ class MotorController:
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
-    def _find_closest_frame(self, frames):
+    @staticmethod
+    def _interpolate_transition(current_angles, target_angles, num_steps=5):
         """
-        Find which frame in the gait cycle is closest to the current
-        servo positions. Returns the index to start playback from.
-        This eliminates the jerk caused by snapping to frame 0 when
-        the servos are mid-cycle at a different position.
+        Generate smooth interpolation frames from current servo positions
+        to the target frame. This replaces _find_closest_frame() which
+        picked a random mid-cycle frame based on angle similarity.
+
+        Real robot dogs do this — smoothly blend from wherever the servos
+        are to the start of the new gait, instead of snapping or guessing.
         """
-        current = self.dog.leg_current_angles
-        best_idx = 0
-        best_dist = float('inf')
-        for i, frame in enumerate(frames):
-            dist = sum((a - b) ** 2 for a, b in zip(current, frame))
-            if dist < best_dist:
-                best_dist = dist
-                best_idx = i
-        return best_idx
+        frames = []
+        for i in range(1, num_steps + 1):
+            t = i / num_steps
+            frame = [
+                current_angles[j] + (target_angles[j] - current_angles[j]) * t
+                for j in range(len(current_angles))
+            ]
+            frames.append(frame)
+        return frames
 
     def _issue_action(self, action, step_count, speed):
         """
-        Issue a movement action with smooth frame alignment.
-        Instead of always starting from frame 0 (causing a servo snap),
-        find the closest frame to the current servo positions and start
-        playback from there. The gait is cyclic so any start point works.
+        Issue a movement action with interpolated transition.
+
+        Instead of snapping to frame 0 or searching for a "closest" frame,
+        smoothly interpolate from the current servo positions to the first
+        frame of the new gait over 5 frames (~100ms). Then play the full
+        gait normally. This eliminates the servo jerk on action changes.
         """
         sdk_name = self.ACTION_MAP.get(action, action)
 
         if sdk_name in self._sharp_turns:
             angles, _ = self._sharp_turns[sdk_name]
         else:
-            # Get SDK gait frames
             try:
                 angles, part = self.dog.actions_dict[sdk_name]
                 if part != "legs":
@@ -812,15 +843,15 @@ class MotorController:
                 self.dog.do_action(sdk_name, step_count=step_count, speed=speed)
                 return
 
-        # Find closest frame and reorder cycle to start there
-        start = self._find_closest_frame(angles)
-        if start > 0:
-            reordered = angles[start:] + angles[:start]
-        else:
-            reordered = angles
+        # Smooth transition: current position → first frame of new gait
+        current = self.dog.leg_current_angles
+        target_first = angles[0]
+        transition = self._interpolate_transition(current, target_first, num_steps=5)
 
+        # Feed transition frames first, then the full gait cycles
+        self.dog.legs_move(transition, immediately=False, speed=speed)
         for _ in range(step_count):
-            self.dog.legs_move(reordered, immediately=False, speed=speed)
+            self.dog.legs_move(angles, immediately=False, speed=speed)
 
     def _bark_warning(self):
         """Danger bark — head-only, same pattern as arrival bark."""

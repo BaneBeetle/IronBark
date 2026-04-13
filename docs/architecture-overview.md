@@ -34,7 +34,7 @@ IronBark is an autonomous VLA (Vision-Language-Action) robot dog built on the Su
 │  │  │         perception_pipeline.py               │       │ │
 │  │  │                                              │       │ │
 │  │  │  Main thread (10 Hz):                        │       │ │
-│  │  │    YOLO11n (MPS) ──▶ ArcFace (CPU)           │       │ │
+│  │  │    YOLO11n (MPS) ──▶ ArcFace gallery (CPU)   │       │ │
 │  │  │    ──▶ IoU tracker ──▶ temporal smoothing     │       │ │
 │  │  │                                              │       │ │
 │  │  │  VLM worker thread (async):                  │       │ │
@@ -62,7 +62,7 @@ The Raspberry Pi 5 cannot run YOLO, ArcFace, and a VLM at real-time speeds simul
 ### Fast Path (10 Hz, ~70ms end-to-end)
 
 ```
-Pi webcam ──[JPEG]──▶ Mac YOLO ──▶ ArcFace ──▶ face smoothing
+Pi webcam ──[JPEG]──▶ Mac YOLO ──▶ ArcFace gallery match ──▶ face smoothing
     ──▶ follower state machine ──▶ Command JSON ──▶ Pi motor_controller
 ```
 
@@ -127,7 +127,8 @@ ironbark/
 ├── .env.example               # Template for .env
 ├── deploy.sh                  # SCP code to Pi
 ├── data/
-│   └── owner_embedding.npy    # Enrolled owner face embedding (512-dim)
+│   ├── owner_gallery.npy      # Multi-distance face embedding gallery (Nx512)
+│   └── owner_embedding.npy    # Legacy single embedding (auto-migrated to gallery)
 │
 ├── pc/                        # Mac-side code (brain)
 │   ├── follower.py            # Phase 6 state machine + main loop
@@ -159,7 +160,7 @@ ironbark/
 
 3. **YOLO-grounded VLM prompting.** YOLO's person count is injected into the VLM prompt. The VLM describes the scene but cannot invent objects YOLO didn't detect.
 
-4. **Multi-shot face enrollment.** 25 face samples, L2-normalized individually, averaged, and re-normalized. Robust across head poses, independent of clothing.
+4. **Multi-distance gallery enrollment.** 30 face samples captured at 3 distances (2 ft, 4 ft, 6-8 ft) from the ground-level camera. Stored as an Nx512 gallery — not averaged — so max-of-gallery matching preserves distance-variant and angle-variant information. Enrollment should happen each session since body ReID (Phase B) will encode clothing appearance.
 
 5. **ZMQ CONFLATE.** Video sockets keep only the latest frame. If the Mac falls behind, stale frames are discarded automatically.
 

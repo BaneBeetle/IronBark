@@ -42,7 +42,7 @@ TARGET_FPS        = 30
 # Phase 2 - Perception Stack
 # =============================================================================
 
-YOLO_MODEL          = "yolo11n.pt"
+YOLO_MODEL          = "yolo11s.pt"
 YOLO_CONF_THRESHOLD = 0.5
 
 # VLM model — moondream is ~5-9x faster than llava:7b and dramatically
@@ -53,17 +53,28 @@ YOLO_CONF_THRESHOLD = 0.5
 VLM_MODEL = "moondream"
 VLM_HOST  = "http://localhost:11434"
 
-FACE_THRESHOLD       = 0.45     # cosine sim cutoff (was 0.35; bumped after multi-shot enrollment)
+FACE_THRESHOLD       = 0.55     # cosine sim cutoff — raised to reduce false positives on roommates
 FACE_CROP_RATIO      = 0.30
-OWNER_EMBEDDING_PATH = "data/owner_embedding.npy"
+OWNER_EMBEDDING_PATH = "data/owner_embedding.npy"   # legacy single-embedding (auto-migrated)
+OWNER_GALLERY_PATH   = "data/owner_gallery.npy"     # Nx512 gallery of distance-variant embeddings
+
+# ── Body ReID (OSNet-AIN) ────────────────────────────────────────
+OWNER_BODY_GALLERY_PATH = "data/owner_body_gallery.npy"  # Nx512 body appearance gallery
+REID_THRESHOLD       = 0.50     # cosine sim cutoff for body ReID — raised to reduce false positives
+REID_FACE_FULL_PX    = 80       # face >= this: trust face heavily (close range)
+REID_FACE_NONE_PX    = 40       # face <  this: trust body almost entirely
 
 # ── Face recognition smoothing & enrollment ──────────────────────
 FACE_SMOOTH_WINDOW   = 5        # rolling window of confidences for is_owner decision
 FACE_TRACK_IOU       = 0.3      # IoU threshold for cross-frame detection matching
-ENROLL_NUM_SAMPLES   = 25       # face crops to capture during enrollment
-ENROLL_TIMEOUT_S     = 8.0      # max seconds to gather all samples
-ENROLL_MIN_FACE_PX   = 80       # min face bbox side (pixels) to accept a sample
-ENROLL_SAMPLE_INTERVAL_S = 0.2  # min seconds between captured samples (forces pose variety)
+
+# Multi-distance enrollment: capture at 3 distances from ground-level camera.
+# Each stage collects ENROLL_SAMPLES_PER_STAGE embeddings.
+ENROLL_DISTANCES     = ["CLOSE (2 ft)", "MEDIUM (3.5 ft)", "FAR (5 ft)"]
+ENROLL_SAMPLES_PER_STAGE = 10   # samples per distance stage (30 total)
+ENROLL_TIMEOUT_S     = 12.0     # max seconds per stage
+ENROLL_MIN_FACE_PX   = 40       # min face bbox side — lowered for far-distance captures
+ENROLL_SAMPLE_INTERVAL_S = 0.25 # min seconds between captured samples (forces pose variety)
 
 # =============================================================================
 # Phase 3 - Follow-Me Behavior
@@ -75,7 +86,7 @@ FRAME_CENTER_X     = 320
 STEERING_DEAD_ZONE = 100
 TARGET_AREA_RATIO  = 0.12
 BODY_TURN_THRESHOLD = 80      # pixels from center before body turns (tighter = less drift)
-BODY_TURN_STEP_COUNT = 12     # gait cycles per turn — strong committed turn like obstacle avoidance
+BODY_TURN_STEP_COUNT = 8      # gait cycles per turn
 FORWARD_STEP_COUNT = 8        # gait cycles per forward (was 2; reduces lurch-on-restart drift)
 MIN_AREA_RATIO     = 0.02
 
@@ -91,12 +102,12 @@ LIDAR_STALE_S             = 1.0             # ignore scans older than this (seco
 
 # Arc definitions (degrees, clockwise: 0=forward, 90=right, 180=behind, 270=left)
 LIDAR_FORWARD_ARC_HALF    = 30              # forward = 330° to 30° (60° wide)
-LIDAR_OBSTACLE_CM         = 35              # trigger avoidance below this (cm)
+LIDAR_OBSTACLE_CM         = 50              # trigger avoidance below this (cm) — react early
 LIDAR_DANGER_CM           = 15              # hard stop below this (cm)
 
 # Obstacle avoidance behavior
-LIDAR_TURN_STEP_COUNT     = 12              # gait cycles for obstacle turn (~90°)
-LIDAR_TURN_HOLD_S         = 2.0             # seconds to hold turn before re-checking
+LIDAR_TURN_STEP_COUNT     = 8               # gait cycles for obstacle turn
+LIDAR_TURN_HOLD_S         = 1.5             # seconds to hold turn before re-checking
 LIDAR_BACKUP_SPEED        = 80              # speed when backing away
 LIDAR_BACKUP_STEP_COUNT   = 6              # gait cycles for backup
 
@@ -115,7 +126,7 @@ EXPLORE_TIMEOUT_S  = 30.0
 HEAD_DEFAULT_PITCH = 15
 
 # ── Timing ──────────────────────────────────────────────────────────
-CMD_INTERVAL        = 0.1       # seconds between Mac→Pi commands (was 0.3)
+CMD_INTERVAL        = 0.5       # seconds between Mac→Pi commands — methodical, not spamming
 FOLLOW_GAIT_PAUSE_S = 0.05     # pause between follow-me gaits (was 0.2)
 
 # ── Arrival behavior — bbox area ratio thresholds ───────────────────
@@ -166,7 +177,7 @@ BEHAVIOR_DEFAULT_MODE = "ACTIVE"
 # ── Part B: Semantic Exploration ──────────────────────────────────
 # VLM guides navigation when owner is lost (EXPLORE state).
 VLM_EXPLORE_STEP_COUNT    = 3       # steps per VLM-directed movement
-VLM_EXPLORE_SPEED         = 70      # cautious explore speed
+VLM_EXPLORE_SPEED         = 90      # explore speed (was 70, too slow)
 VLM_EXPLORE_BACK_STEPS    = 8       # step_count for 180° turn (BACK direction)
 VLM_EXPLORE_DIRECTION_TIMEOUT_S = 5.0  # expire stale explore direction
 

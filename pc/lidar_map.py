@@ -161,6 +161,94 @@ class LidarMap:
         with self.lock:
             return self._scan_count > 0 and not self._is_stale()
 
+    def get_scan(self):
+        """Get a copy of the latest scan for visualization. Returns list of (angle_deg, distance_mm)."""
+        with self.lock:
+            return list(self._scan)
+
+    def find_best_direction(self, obstacle_cm: float = 50) -> tuple:
+        """
+        Find the direction with the most free space by scanning all angles.
+        Returns (best_angle_deg, best_distance_cm).
+
+        Divides the 360° scan into 12 sectors (30° each), finds the minimum
+        distance in each sector, then picks the sector with the largest
+        minimum distance. This is a simple "gap finder" — it always points
+        toward the most open space.
+
+        Returns (best_angle, best_dist_cm) where best_angle is the center
+        of the best sector (0=forward, 90=right, 180=behind, 270=left).
+        """
+        with self.lock:
+            if not self._scan or self._is_stale():
+                return (0, 999)  # default forward
+            scan = list(self._scan)
+
+        # 12 sectors of 30° each
+        num_sectors = 12
+        sector_size = 360.0 / num_sectors
+        sector_mins = [999.0] * num_sectors
+
+        for angle, dist_mm in scan:
+            dist_cm = dist_mm / 10.0
+            if dist_cm < 0.5:
+                continue
+            sector = int(angle / sector_size) % num_sectors
+            if dist_cm < sector_mins[sector]:
+                sector_mins[sector] = dist_cm
+
+        # Find sector with largest minimum distance (most open)
+        best_sector = 0
+        best_dist = 0
+        for i, d in enumerate(sector_mins):
+            if d > best_dist:
+                best_dist = d
+                best_sector = i
+
+        best_angle = best_sector * sector_size + sector_size / 2
+        return (best_angle, best_dist)
+
+    def get_direction_to_go(self, obstacle_cm: float = 50) -> str:
+        """
+        High-level: which way should the dog go?
+        Returns "forward", "turn_left", "turn_right", "backward", or "stop".
+
+        Uses find_best_direction() to find the most open space,
+        then maps the angle to a motor command. Includes backward
+        because turns also move the dog forward (2-DOF legs).
+        """
+        fwd = self.get_forward_distance()
+        rear = self.get_rear_distance()
+
+        # If very close to a wall ahead, MUST back up first.
+        # Turning won't help because turns move forward too.
+        if fwd < 20:
+            if rear > 30:
+                return "backward"
+            else:
+                return "stop"  # boxed in
+
+        best_angle, best_dist = self.find_best_direction(obstacle_cm)
+
+        if best_dist < obstacle_cm:
+            # All forward/side directions blocked — back up if possible
+            if rear > 30:
+                return "backward"
+            return "stop"
+
+        # Map angle to action (0=forward, 90=right, 180=behind, 270=left)
+        if best_angle <= 45 or best_angle >= 315:
+            return "forward"
+        elif 135 < best_angle <= 225:
+            # Best direction is behind — back up instead of 180° turn
+            if rear > 30:
+                return "backward"
+            return "turn_left"  # fallback to 180° turn
+        elif 45 < best_angle <= 135:
+            return "turn_right"
+        else:
+            return "turn_left"
+
     @staticmethod
     def _angle_in_arc(angle: float, start: float, end: float) -> bool:
         """Check if angle is within the arc from start to end (clockwise)."""

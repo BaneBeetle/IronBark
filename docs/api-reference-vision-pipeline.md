@@ -33,7 +33,7 @@ pipeline = PerceptionPipeline(config)
 
 **Initialization behavior:**
 - Creates `YOLODetector` (auto-detects MPS/CUDA/CPU)
-- Creates `FaceRecognizer` (loads `owner_embedding.npy` if it exists)
+- Creates `FaceRecognizer` (loads `owner_gallery.npy` if it exists; auto-migrates legacy `owner_embedding.npy`)
 - Creates `VLMReasoner` (connects to Ollama)
 - Prepares VLM worker thread (not started until `start()` is called)
 
@@ -102,7 +102,7 @@ result = pipeline.process_frame(frame, nav_frame=latest_nav_frame)
 1. YOLO detection on `frame` -> list of `PersonDetection`
 2. InsightFace face detection on full `frame` (finds all faces)
 3. For each YOLO person bbox, match the nearest InsightFace face by geometric overlap
-4. Compute cosine similarity of each matched face against `owner_embedding.npy`
+4. Compute max-of-gallery cosine similarity against all embeddings in `owner_gallery.npy`
 5. Apply temporal smoothing (IoU tracking + rolling confidence window)
 6. Queue a VLM query if interval elapsed (situation) or on-demand (explore)
 7. Read latest VLM results from the worker thread (non-blocking lock)
@@ -228,13 +228,14 @@ class PersonDetection:
 
 **Module:** `pc/perception/face_recognizer.py`
 
-Identifies whether a detected person is the registered owner using ArcFace embeddings.
+Identifies whether a detected person is the registered owner using ArcFace embeddings. Uses a **gallery of distance-variant embeddings** (not a single averaged embedding) for robust matching at varying distances and angles.
 
 ### `class FaceRecognizer`
 
 ```python
 recognizer = FaceRecognizer(
     embedding_path="data/owner_embedding.npy",
+    gallery_path="data/owner_gallery.npy",
     threshold=0.6,
     model_pack="buffalo_l"
 )
@@ -244,19 +245,41 @@ recognizer = FaceRecognizer(
 
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
-| `embedding_path` | str | `"data/owner_embedding.npy"` | Path to the enrolled owner's 512-dim embedding file |
+| `embedding_path` | str | `"data/owner_embedding.npy"` | Legacy single-embedding path. Auto-migrated to a 1-row gallery if no gallery file exists. |
+| `gallery_path` | str | `"data/owner_gallery.npy"` | Path to the Nx512 owner embedding gallery. This is the primary enrollment format. |
 | `threshold` | float | `0.6` | Cosine similarity cutoff. Values above this are classified as owner. Overridden by `config.FACE_THRESHOLD` (0.45) at runtime. |
 | `model_pack` | str | `"buffalo_l"` | InsightFace model pack. `buffalo_l` includes ArcFace ResNet50. |
 
 **Notes:**
 - Uses CPU inference (`ctx_id=-1`). InsightFace doesn't support MPS natively, but CPU is fast enough on Apple Silicon.
-- If `owner_embedding.npy` doesn't exist, recognition always returns `is_owner=False`.
+- If neither gallery nor legacy embedding exists, recognition always returns `is_owner=False`.
+- `owner_embedding` (single 512-d vector) is still available as a property — derived as the L2-normalized mean of the gallery. Used by `draw_overlay()` to detect unenrolled state.
+
+---
+
+### `match_gallery(embedding)`
+
+Max-of-gallery cosine similarity. Returns the highest similarity between the query and any gallery embedding.
+
+```python
+score = recognizer.match_gallery(face_embedding)  # float, 0.0-1.0
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `embedding` | `np.ndarray` | 512-dim face embedding from InsightFace |
+
+**Returns:** `float` — Maximum cosine similarity across the gallery (0.0 if no gallery loaded).
+
+**Why max-of-gallery:** Averaging embeddings across distances destroys scale-variant information. A face captured at 2 ft and at 6 ft from a ground-level camera produces genuinely different embeddings (angle, resolution, lighting). Nearest-neighbor matching finds the best match regardless of capture conditions.
 
 ---
 
 ### `recognize(face_crop)`
 
-Compare a face crop against the enrolled owner.
+Compare a face crop against the enrolled owner gallery.
 
 ```python
 match = recognizer.recognize(face_crop)
@@ -273,34 +296,33 @@ match = recognizer.recognize(face_crop)
 **Processing:**
 1. Run InsightFace face detection + embedding extraction on the crop.
 2. If no face found, return `FaceMatch(is_owner=False, confidence=0.0)`.
-3. Compute cosine similarity between the detected face embedding and `owner_embedding`.
+3. Compute `match_gallery()` — max cosine similarity across the full gallery.
 4. If similarity >= threshold, `is_owner=True`.
 
 ---
 
 ### `enroll_owner(embeddings)`
 
-Create the owner embedding from multiple face samples.
+Create the owner gallery from multi-distance face samples.
 
 ```python
-final_embedding = recognizer.enroll_owner(embeddings_list)
+gallery = recognizer.enroll_owner(embeddings_list)
 ```
 
 **Parameters:**
 
 | Name | Type | Description |
 |------|------|-------------|
-| `embeddings` | List[np.ndarray] | List of 512-dim face embeddings (typically 25 samples) |
+| `embeddings` | List[np.ndarray] | List of 512-dim face embeddings (typically 30 samples: 10 per distance stage) |
 
-**Returns:** `np.ndarray` — The final 512-dim owner embedding (unit length).
+**Returns:** `np.ndarray` — Nx512 gallery matrix (L2-normalized rows).
 
 **Processing:**
 1. L2-normalize each embedding individually.
-2. Compute the element-wise mean across all normalized embeddings.
-3. Re-normalize the mean to unit length.
-4. Save to `owner_embedding.npy`.
+2. Stack into an Nx512 matrix.
+3. Save to `owner_gallery.npy`.
 
-**Why multi-shot:** A single embedding is brittle — it's biased toward whatever head angle the enrollment photo captured. Averaging 25 samples across different head poses creates a rotation-invariant embedding.
+**Why gallery over averaging:** The enrollment captures the owner at 3 distances (2 ft, 4 ft, 6-8 ft) from the ground-level camera. Each distance produces different face scale and camera angle. Storing all embeddings and matching via nearest-neighbor preserves this distance-variant information. The previous approach of averaging 25 samples into a single embedding destroyed exactly the information needed to match at operating distance.
 
 ---
 
@@ -475,7 +497,7 @@ class ExploreResponse:
 |-----------|----------------|-----------|--------|
 | YOLO11n detection | ~30ms | Every frame (10 Hz) | Main |
 | InsightFace face detection | ~40ms | Every frame with detections | Main |
-| ArcFace cosine similarity | <1ms | Per face | Main |
+| ArcFace gallery match (max-of-N cosine sim) | <1ms | Per face | Main |
 | Temporal smoothing (IoU + window) | <1ms | Every frame | Main |
 | **Fast path total** | **~60-75ms** | **10 Hz** | **Main** |
 | Moondream situation query | ~245ms | Every 2.5s | VLM worker |
